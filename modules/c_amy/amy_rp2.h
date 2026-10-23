@@ -1,0 +1,46 @@
+// amy_rp2.h -- AMY on MicroPython rp2 (RP2350 / RP2040).
+//
+// All AMY work (parsing, rendering, MIDI-UART polling, I2S DMA) runs on core 1.
+// Core 0 (the MicroPython VM) only pushes commands into a single-producer /
+// single-consumer ring that core 1 drains between blocks, so AMY's own locks
+// (no-ops on bare pico-sdk) are never needed.
+
+#ifndef AMY_RP2_H
+#define AMY_RP2_H
+
+#include <stdbool.h>
+#include <stdint.h>
+#include "amy.h"
+
+// Ring entry types.
+#define AMY_RP2_CMD_WIRE        0  // wire message, amy_add_message()
+#define AMY_RP2_CMD_WIRE_SYSEX  1  // wire message, amy_send_wire_from_sysex()
+#define AMY_RP2_CMD_MIDI        2  // raw MIDI bytes, convert_midi_bytes_to_messages()
+#define AMY_RP2_CMD_BLEEP       3  // decimal start time, amy_bleep()
+
+// Start AMY on core 1 with config c (audio must be AMY_AUDIO_IS_I2S or NONE).
+// Returns false if core 1 could not be started.
+bool amy_rp2_start(amy_config_t c);
+void amy_rp2_stop(void);
+bool amy_rp2_running(void);
+
+// Queue a command for core 1.  Blocks (up to timeout_ms) if the ring is full.
+// Returns false on timeout or if AMY isn't running.
+bool amy_rp2_push(uint8_t type, const uint8_t *data, size_t len, uint32_t timeout_ms);
+
+// Number of blocks DMA had to restart after running dry (audio underruns).
+uint32_t amy_rp2_underruns(void);
+
+// Allocation stats (amy_rp2_mem.c).
+void amy_rp2_mem_stats(uint32_t *sram_used, uint32_t *sram_free, uint32_t *psram_used,
+                       uint32_t *psram_size, uint32_t *failures);
+
+// Startup breadcrumbs, kept in watchdog scratch registers so they survive the
+// watchdog reboot that amy_rp2_start() arms around amy_start().
+//   scratch[0] = AMY_RP2_CRUMB | stage, [1] = PSRAM pool bytes, [2] = failed allocs
+#define AMY_RP2_CRUMB 0xA3700000u
+
+// Hook for MICROPY_BOARD_START_SOFT_RESET.
+void amy_rp2_soft_reset(void);
+
+#endif
