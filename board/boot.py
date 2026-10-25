@@ -1,10 +1,10 @@
-# boot.py -- start AMY on every boot and soft reset, so the board answers MIDI
-# (and amyboard.com/editor) without anyone running amy.live() first.
+# boot.py -- start AMY and amyboard.py (sketch.py, editor support) on every boot
+# and soft reset.
 # Install:  mpremote cp board/boot.py :boot.py      Remove:  mpremote rm :boot.py
 try:
-    import amy
-    amy.live()
+    import amyboard_boot
+    amyboard_boot.boot()
 except Exception as e:
     import sys
-    print("boot.py: AMY failed to start:")
+    print("boot.py: AMYboard start failed:")
     sys.print_exception(e)

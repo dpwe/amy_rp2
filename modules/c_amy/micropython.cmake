@@ -35,6 +35,7 @@ target_sources(usermod_c_amy INTERFACE
     ${CMAKE_CURRENT_LIST_DIR}/amy_rp2_mem.c
     ${CMAKE_CURRENT_LIST_DIR}/amy_rp2_usb.c
     ${CMAKE_CURRENT_LIST_DIR}/amy_rp2_sysex.c
+    ${CMAKE_CURRENT_LIST_DIR}/amy_rp2_tulip.c
     ${CMAKE_CURRENT_LIST_DIR}/newlib_locks.c
     ${AMY_RP2_AMY_SOURCES}
 )

@@ -9,5 +9,8 @@ package(
     opt=2,
 )
 
-# Interim amyboard module for amyboard.com/editor (until the real amyboard.py).
-module("amyboard.py", base_path="$(BOARD_DIR)/../../py")
+# AMYboard firmware Python, unchanged from tulipcc (scripts/sync_tulipcc_py.sh),
+# plus this board's _tulip and boot sequence.
+freeze("$(BOARD_DIR)/../../py/tulipcc")
+module("_tulip.py", base_path="$(BOARD_DIR)/../../py")
+module("amyboard_boot.py", base_path="$(BOARD_DIR)/../../py")

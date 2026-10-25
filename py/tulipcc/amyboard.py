@@ -1,0 +1,1780 @@
+# amyboard.py
+import tulip, midi, amy, time, struct, time, sys, os
+from tulip import wifi, upgrade
+
+i2c = None
+display = None # Display instance (unified interface for all display types)
+
+# A sketch's loop(tick) is called every 32nd note and receives the AMY
+# sequencer's absolute tick.  This is the tick span of one of those calls, so
+# `step = tick // amyboard.TICKS_PER_STEP` recovers the bar-locked 32nd-note
+# index (step % 32 == 0 on a downbeat).  Derived from AMY's PPQ rather than
+# hardcoded: 4 quarter notes per bar / 32 steps per bar * PPQ = 6 at 48 PPQ.
+TICKS_PER_STEP = int((4.0 / 32.0) * amy.AMY_SEQUENCER_PPQ)
+
+# Consecutive loop() exceptions before the sketch loop gives up. It fires
+# every 32nd note, so a persistently broken loop() would otherwise flood the
+# console and starve the REPL.
+_MAX_LOOP_FAILS = 8
+
+# Web encoder emulation state (used when running on AMYBOARD_WEB)
+_web_encoder_pos = 0      # cumulative encoder position
+_web_encoder_button = False  # current button state
+
+def web():
+    return (tulip.board()=="AMYBOARD_WEB")
+
+def _vcv():
+    # AMYboard running inside the VCV Rack plugin (see tulip/vcvrack/).
+    return (tulip.board()=="AMYBOARD_VCV")
+
+def cv_capable():
+    """True on boards with AMYboard CV hardware. This module is also frozen
+    into Tulip builds (so AMYboard World sketches run there via
+    world.amyboard.download()); on Tulip the CV helpers below just no-op."""
+    return tulip.board() in ("AMYBOARD", "AMYBOARD_WEB", "AMYBOARD_VCV")
+
+
+class _BGWriteI2C:
+    """i2c-shaped adapter that enqueues writes on the firmware's background
+    I2C task (tulip.i2c_bg_write) instead of blocking Python on the bus, so a
+    display refresh returns immediately and the bytes clock out at 400kHz in
+    the background.  Payloads are chunked so the CV tasks' small transactions
+    on the same port interleave between chunks instead of timing out.
+
+    writevto() assumes bufs[0] is a one-byte OLED control prefix that must be
+    repeated on each chunk (true of the ssd1327/sh1107 drivers' write_data);
+    the panel's address pointer carries across transactions, so consecutive
+    chunks land contiguously on the glass."""
+    _CHUNK = 256
+
+    def writeto(self, addr, buf):
+        tulip.i2c_bg_write(addr, buf)
+
+    def writevto(self, addr, bufs):
+        bufs = list(bufs)
+        prefix = bytes(bufs[0])
+        data = bufs[1] if len(bufs) == 2 else b''.join(bytes(b) for b in bufs[1:])
+        step = self._CHUNK - len(prefix)
+        if len(data) <= step:
+            tulip.i2c_bg_write(addr, prefix + bytes(data))
+            return
+        mv = memoryview(data)
+        for off in range(0, len(data), step):
+            tulip.i2c_bg_write(addr, prefix + bytes(mv[off:off + step]))
+
+
+def _i2c_bg_available():
+    return hasattr(tulip, 'i2c_bg_write')
+
+
+def _i2c_bg_drain(max_ms=500):
+    """Wait (briefly, bounded) for the background I2C queue to empty."""
+    while tulip.i2c_bg_pending() and max_ms > 0:
+        time.sleep_ms(5)
+        max_ms -= 5
+
+
+class Display:
+    """Unified display interface for ssd1327, sh1107, and web framebuffer.
+
+    Drawing methods (text, fill_rect, line, fill, pixel, rect, scroll) are
+    forwarded to the underlying framebuf.  ``show()`` does the right thing
+    for each backend so callers never need to know which hardware is present.
+    """
+    WIDTH = 128
+    HEIGHT = 128
+    LINEHEIGHT = 12
+
+    def __init__(self, rotate=0):
+        self._hw = None        # hardware driver (ssd1327 or sh1107), None for web
+        self._fb = None        # framebuf used for drawing
+        self._buf = None       # raw byte buffer backing the framebuf
+        self._is_web = web() or _vcv()   # VCV shares the framebuf push path
+        self._bg = False       # panel writes routed through the background I2C task
+        self._last_bg_err = 0
+
+        if self._is_web:
+            import framebuf
+            self._buf = bytearray(self.WIDTH * self.HEIGHT // 2)
+            self._fb = framebuf.FrameBuffer(self._buf, self.WIDTH, self.HEIGHT, framebuf.GS4_HMSB)
+        else:
+            if _i2c_bg_available():
+                # a previous Display instance may still have queued panel
+                # writes; let them finish before probing/re-initing
+                _i2c_bg_drain()
+            # Try ssd1327 first, then sh1107.  rotate only applies to the sh1107
+            # (the panel is square, so WIDTH/HEIGHT are unchanged by rotation).
+            try:
+                hw = ssd1327_oled()
+                self._hw = hw
+                self._buf = hw.buffer
+                self._fb = hw.framebuf
+            except Exception:
+                try:
+                    hw = sh1107_oled(rotate=rotate)
+                    self._hw = hw
+                    self._buf = hw.displaybuf
+                    self._fb = hw  # sh1107 *is* a FrameBuffer subclass
+                except Exception:
+                    pass  # no physical display
+            if self._hw is not None and _i2c_bg_available():
+                # Probe + init above ran synchronously (so a missing panel
+                # raises and we fall through).  From here on, route panel
+                # writes through the background queue: show() then returns
+                # immediately instead of blocking on the I2C transfer.
+                self._hw.i2c = _BGWriteI2C()
+                self._bg = True
+                self._last_bg_err = tulip.i2c_bg_errors()
+
+    @property
+    def buffer(self):
+        return self._buf
+
+    @property
+    def available(self):
+        return self._fb is not None
+
+    # -- drawing primitives (forwarded to framebuf) --
+
+    def text(self, string, x, y, col=255):
+        if self._fb is not None:
+            self._fb.text(string, x, y, col)
+
+    def fill(self, col):
+        if self._fb is not None:
+            self._fb.fill(col)
+
+    def fill_rect(self, x, y, w, h, col):
+        if self._fb is not None:
+            self._fb.fill_rect(x, y, w, h, col)
+
+    def line(self, x1, y1, x2, y2, col):
+        if self._fb is not None:
+            self._fb.line(x1, y1, x2, y2, col)
+
+    def hline(self, x, y, w, col):
+        if self._fb is not None:
+            self._fb.hline(x, y, w, col)
+
+    def vline(self, x, y, h, col):
+        if self._fb is not None:
+            self._fb.vline(x, y, h, col)
+
+    def pixel(self, x, y, col=None):
+        if self._fb is None:
+            return None
+        if col is None:
+            return self._fb.pixel(x, y)
+        self._fb.pixel(x, y, col)
+
+    def rect(self, x, y, w, h, col):
+        if self._fb is not None:
+            self._fb.rect(x, y, w, h, col)
+
+    def scroll(self, dx, dy):
+        if self._fb is not None:
+            self._fb.scroll(dx, dy)
+
+    # Next-layer-up API
+    def clear(self):
+        self.fill(0)
+        self.show()
+
+    def message(self, message, row=0, inverse=False):
+        """Display some text on a row on the display."""
+        top_y = self.LINEHEIGHT * row
+        bw = (255, 0) if inverse else (0, 255)
+        self.fill_rect(0, top_y, self.WIDTH, self.LINEHEIGHT, bw[0])
+        self.text(message, 0, top_y, bw[1])
+        self.show()
+
+    # -- refresh --
+
+    def show(self, full=False):
+        """Push the framebuffer to the display hardware (or web bridge).
+
+        Both hardware drivers diff against what the panel already shows and
+        transfer only the changed portion, and on firmware with the
+        background I2C task the transfer itself happens off the Python
+        thread — show() just queues it and returns.  Pass full=True to force
+        the entire framebuffer out.
+        """
+        if self._fb is None:
+            return
+        if self._is_web:
+            tulip.framebuf_web_update(self._buf)
+        elif self._hw is not None:
+            if self._bg:
+                err = tulip.i2c_bg_errors()
+                if err != self._last_bg_err:
+                    # a queued write failed, so the panel may no longer match
+                    # the driver's shadow -- resync everything this refresh
+                    self._last_bg_err = err
+                    self._hw._shadow_valid = False
+            self._hw.show(full)
+
+    # convenience alias so old code calling display_refresh() on a Display works
+    refresh = show
+
+DEFAULT_SKETCH_SOURCE = """\
+# AMYboard Sketch
+# Code put here runs first, then loop(tick) is called every 32nd note,
+# starting on a bar downbeat. tick is AMY's sequencer tick, so it can go
+# straight into amy.send(ticks=...). For 32nd-note counting divide it:
+# step = tick // amyboard.TICKS_PER_STEP  (step % 32 == 0 on a downbeat).
+import amyboard, amy
+
+def loop(tick):
+    pass
+
+# Do not edit. Set automatically by the knobs on AMYboard Online.
+_auto_generated_knobs = \"\"\"
+\"\"\"
+"""
+
+def _path_exists(path):
+    import os
+    try:
+        os.stat(path)
+        return True
+    except OSError:
+        return False
+
+def _remove_tree(path):
+    import os
+    try:
+        mode = os.stat(path)[0]
+    except OSError:
+        return
+    if mode & 0x4000:  # directory
+        try:
+            entries = os.ilistdir(path)
+        except OSError:
+            entries = []
+        for entry in entries:
+            name = entry[0]
+            if name == "." or name == "..":
+                continue
+            _remove_tree(path.rstrip("/") + "/" + name)
+        try:
+            os.rmdir(path)
+        except OSError:
+            pass
+    else:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+def _clear_directory(path):
+    import os
+    try:
+        entries = os.ilistdir(path)
+    except OSError:
+        return
+    for entry in entries:
+        name = entry[0]
+        if name == "." or name == "..":
+            continue
+        _remove_tree(path.rstrip("/") + "/" + name)
+
+
+def ensure_user_environment():
+    import os
+    user_base = tulip.root_dir() + "user"
+    current_base = user_base + "/current"
+    for path in (user_base, current_base):
+        try:
+            os.mkdir(path)
+        except OSError:
+            pass
+
+    current_sketch_file = current_base + "/sketch.py"
+    try:
+        open(current_sketch_file, "r").close()
+    except OSError:
+        w = open(current_sketch_file, "w")
+        w.write(DEFAULT_SKETCH_SOURCE)
+        w.close()
+
+    return current_base
+
+def _ensure_current_env_layout():
+    return ensure_user_environment()
+
+
+# -- _auto_generated_knobs helpers --
+
+_KNOBS_MARKER = '_auto_generated_knobs = """'
+_KNOBS_END = '"""'
+_KNOBS_MARKER_B = _KNOBS_MARKER.encode("utf-8")
+_KNOBS_END_B = _KNOBS_END.encode("utf-8")
+
+def _extract_knobs_from_file(filepath):
+    """Read sketch.py as bytes and extract the _auto_generated_knobs content without importing.
+
+    Reads as bytes so non-UTF-8 bytes elsewhere in the file don't break us;
+    the knobs section itself is always ASCII (AMY wire protocol)."""
+    try:
+        data = open(filepath, "rb").read()
+    except OSError:
+        return ''
+    start = data.find(_KNOBS_MARKER_B)
+    if start < 0:
+        return ''
+    body_start = start + len(_KNOBS_MARKER_B)
+    end = data.find(_KNOBS_END_B, body_start)
+    if end < 0:
+        return ''
+    body = data[body_start:end]
+    try:
+        return body.decode("utf-8").strip()
+    except UnicodeError:
+        # Knobs section had bad bytes somehow — fall back to ASCII-only decode.
+        try:
+            return "".join(chr(b) for b in body if b < 128).strip()
+        except Exception:
+            return ''
+
+# Drum kits are single-voice since amy#913: the one voice is a container
+# holding one dedicated osc per drum sound (~38 oscs). Sketches saved before
+# that recorded i<ch>K<kit>iv6 setup lines (which would now allocate 6 x ~38
+# oscs and exhaust the pool) and io note-map lines whose templates bake the
+# PCM preset instead of referencing the per-drum osc (a hit through one would
+# broadcast to every osc in the voice). Normalize the former to iv1 and drop
+# the latter when replaying a sketch's knob lines; the web editor migrates
+# the dropped lines' tweaks into the current form next time the sketch is
+# opened there.
+_DRUM_KIT_PATCHES = (258, 384, 385, 386, 387, 388, 389, 390)
+
+def _normalize_knob_line(line):
+    k = line.find('K')
+    if k < 0:
+        return line
+    j = k + 1
+    while j < len(line) and line[j].isdigit():
+        j += 1
+    if j > k + 1 and int(line[k + 1:j]) in _DRUM_KIT_PATCHES and line[j:j + 2] == 'iv':
+        e = j + 2
+        while e < len(line) and line[e].isdigit():
+            e += 1
+        if e > j + 2 and int(line[j + 2:e]) > 1:
+            line = line[:j] + 'iv1' + line[e:]
+    return line
+
+def _legacy_drum_io_line(line):
+    # i<ch>io<note>,L,N,X,O,<template>: pre-amy#913 templates start with the
+    # baked base note (n60...); current ones with the drum's osc (v4n60...).
+    if not line.startswith('i'):
+        return False
+    j = 1
+    while j < len(line) and line[j].isdigit():
+        j += 1
+    if line[j:j + 2] != 'io':
+        return False
+    parts = line.split(',', 5)
+    return len(parts) == 6 and not parts[5].startswith('v')
+
+def _apply_knobs_text(knobs_text):
+    """Reset AMY to a known default, then apply the sketch's knob lines on top.
+
+    The sketch is the single source of truth, so every restart starts from a
+    clean slate: S<RESET_SYNTHS> clears all synths and MIDI CC maps,
+    i1K257iv6 installs the amyboard default synth on channel 1 (which also
+    reinstalls the default CC map so a plugged-in MIDI controller works out of
+    the box before the website pushes anything), and i10K384iv1 installs the
+    GM drum kit (TR-808; kits 385-390 selectable via PC bank MSB 3) on channel
+    10 — drum kits are single-voice: the one voice is a container holding one
+    dedicated osc per drum sound (amy#913), so num_voices must be 1. The _auto_generated_knobs lines are then applied on top, and may
+    override channel 1 or 10, configure other channels, or deactivate a
+    channel with iv0. We never grab or merge live AMY state here — what the
+    sketch says is exactly what the board becomes.
+    """
+    amy.send_raw("S%dZ" % amy.RESET_SYNTHS)
+    amy.send_raw("i1K257iv6Z")
+    amy.send_raw("i10K384iv1Z")
+    if not knobs_text:
+        return
+    for line in knobs_text.strip().split('\n'):
+        line = line.strip()
+        if line and not line.startswith('#'):
+            line = _normalize_knob_line(line)
+            if _legacy_drum_io_line(line):
+                continue  # stale pre-amy#913 drum mapping — see above
+            amy.send_raw(line)
+
+
+def factory_reset(*_args):
+    """Reset AMYboard to defaults: clear current/ folder and restart sketch."""
+    import os
+    tulip.stderr_write("factory reset — clearing current/ and writing default sketch.py")
+    # Tear down AMY FIRST. restart_sketch() below sends this again as part of
+    # _apply_knobs_text, but only after the file cleanup, an env re-create and
+    # a cd — if any of those throws, the reset must not leave the old
+    # session's synths playing (the web editor resets its UI regardless, so a
+    # silent failure here left AMY holding e.g. a DX7 synth the UI no longer
+    # showed). Idempotent: worst case AMY resets twice.
+    amy.send_raw("S%dZ" % amy.RESET_SYNTHS)
+    user_base = tulip.root_dir() + "user"
+    current_base = user_base + "/current"
+    try:
+        for f in os.listdir(current_base):
+            try:
+                os.remove(current_base + "/" + f)
+            except OSError:
+                pass
+    except OSError:
+        pass
+    env_dir = _ensure_current_env_layout()
+    restart_sketch()
+
+def environment_transfer_done(*_args):
+    """Called after sketch.py is received via zT file transfer.
+    The transferred file already has the correct _auto_generated_knobs,
+    so we just restart the sketch without re-injecting the (stale) AMY state."""
+    tulip.stderr_write("sketch.py transfer done — restarting sketch")
+    # zT stops the sequencer during transfer — restart it before running the sketch.
+    tulip.sequencer_start()
+    restart_sketch()
+
+
+def mount_sd():
+    # mount the SD card if given
+    import machine, uos
+    try:
+        sd = machine.SDCard(sck=12, miso=13, mosi=11, cs=10,slot=2)
+        uos.mount(uos.VfsFat(sd), '/sd')
+        print("SD card mounted as /sd")
+    except OSError:
+        pass # it's ok!
+
+# Which MIDI OUT TRS standard is live. The two standards swap the TRS tip/ring,
+# so on AMYboard "Type A" vs "Type B" is simply which GPIO carries MIDI OUT (UART TX):
+#   Type A -> pin 14 (GPIO15 held high)
+#   Type B -> pin 15 (GPIO14 held high)
+# Only MIDI OUT differs by type; MIDI IN works for both. Default is Type A.
+_MIDI_OUT_PINS = {'A': 14, 'B': 15}
+_midi_type = 'A'
+
+
+def _normalize_midi_type(type):
+    type = str(type).upper()
+    if type not in _MIDI_OUT_PINS:
+        raise ValueError("MIDI type must be 'A' or 'B'")
+    return type
+
+
+def init_midi(type='A'):
+    # Deprecated alias for set_midi_type(), kept for older sketches and docs.
+    return set_midi_type(type)
+
+
+def set_midi_type(type):
+    # Set the MIDI OUT TRS standard ('A' or 'B'). This is the single MIDI OUT init
+    # sequence — start_amy() calls it at boot and sketches call it at runtime — backed
+    # by amyboard_set_midi_out() in amy_connector.c, which points the UART TX line at
+    # the data leg and holds the unused leg high (MIDI idle/source). AMY keeps running.
+    # No persistence — this resets to the default (Type A) on reboot.
+    global _midi_type
+    type = _normalize_midi_type(type)
+    if _vcv():
+        _midi_type = type
+        return type
+    tulip.amyboard_set_midi_out(_MIDI_OUT_PINS[type])
+    _midi_type = type
+    return type
+
+
+def midi_type():
+    # The MIDI OUT TRS standard currently in use ('A' or 'B').
+    return _midi_type
+
+
+def start_amy():
+    if _vcv():
+        # AMY is already running in-process (the Rack module called run_amy()
+        # before booting MicroPython); no codec, UART or boot button here.
+        tulip.amy_overload_callback(_on_amy_overload)
+        amy.send_raw("i1K257iv6Z")
+        amy.send_raw("i10K384iv1Z")
+        _ensure_current_env_layout()
+        try:
+            run_sketch()
+        except Exception as e:
+            print("Environment start failed:")
+            sys.print_exception(e)
+        return
+    init_pcm9211()
+    init_gp8413()  # newer GP8413 batches (v1.5 boards) power up half-scale
+    # AMY binds its MIDI UART TX to this pin at start; set_midi_type() right after is
+    # the single MIDI OUT init sequence (it also holds the unused TRS leg high). It
+    # needs AMY's UART driver, which amy_start() installs, so it must come second.
+    tulip.amyboard_start(_MIDI_OUT_PINS[_midi_type])
+    set_midi_type(_midi_type)
+    tulip.amy_overload_callback(_on_amy_overload)
+    # Boot defaults so the board makes sound before (or without) a sketch:
+    # the amyboard patch on channel 1 and GM drums (kit 0, TR-808) on channel
+    # 10. Sketch startup re-applies these via _apply_knobs_text.
+    amy.send_raw("i1K257iv6Z")
+    amy.send_raw("i10K384iv1Z")
+    _env_dir = _ensure_current_env_layout()
+
+    if tulip.bootloader_mode():
+        tulip.stderr_write("bootloader mode — sketch skipped, waiting for commands")
+        return
+
+    from upysh import cd
+    try:
+        from machine import Pin
+        button = Pin(0, Pin.IN, Pin.PULL_UP)
+        if button.value() != 0:  # Skip sketch if boot button held
+            run_sketch()
+    except Exception as e:
+        print("Environment start failed:")
+        sys.print_exception(e)
+
+
+# -- sketch.py support (top-level init + loop) --
+
+_sketch_seq = None  # Keep reference to prevent GC
+
+# Cap on the traceback text we ship in a single 'X' sysex frame. One sysex
+# frame is reliably delivered over Web MIDI up to ~768 raw bytes (see
+# ZDUMP_STREAM_RAW_CHUNK in amy/src/transfer.c); we stay comfortably under that
+# after base64 expansion. Real MicroPython sketch tracebacks are ~150-300 bytes,
+# so this only ever trims pathologically deep stacks.
+_SKETCH_ERROR_MAX = 700
+
+def _format_exc_for_report(e):
+    """Full traceback (with file/line numbers) as a string, bounded so it fits
+    in a single error sysex frame. MicroPython prints most-recent-call-last, so
+    the exception type/message is the LAST line — when we must truncate we keep
+    the tail (the part the user needs) and drop the outermost frames."""
+    try:
+        from io import StringIO
+        buf = StringIO()
+        sys.print_exception(e, buf)
+        text = buf.getvalue().strip()
+    except Exception:
+        # If capture fails for any reason, fall back to the old one-liner so the
+        # web still gets *something* rather than nothing.
+        text = "%s: %s" % (type(e).__name__, e)
+    if len(text) > _SKETCH_ERROR_MAX:
+        text = "...(traceback truncated)\n" + text[-_SKETCH_ERROR_MAX:]
+    return text
+
+def _report_sketch_error(detail):
+    """Push a sketch load error back to the web editor over sysex, framed as
+    F0 00 03 45 'X' <base64 text> F7, so the UI can surface the failure (banner +
+    a red marker on the Code tab) instead of it only appearing on the serial
+    console. Best-effort and self-contained: a reporting failure must never mask
+    the original error or break the self-heal. In simulate the web already catches
+    the error off the JS console, so this matters mainly for control mode (where
+    stderr goes to the serial port, not the browser)."""
+    try:
+        import binascii
+        payload = binascii.b2a_base64(str(detail).encode('utf-8')).rstrip()
+        tulip.midi_out(bytes([0xF0, 0x00, 0x03, 0x45, 0x58]) + payload + bytes([0xF7]))
+    except Exception:
+        pass
+
+def _on_amy_overload(load_pct):
+    """Called (via tulip.amy_overload_callback, scheduled from the AMY render
+    task) after AMY's CPU overload failsafe has already reset the synth and
+    played its bleep. Stop the sketch loop so it can't drive the board back
+    into overload, then tell the web editor over sysex, framed as
+    F0 00 03 45 'L' <base64 load percent> F7, so it can pop the "this sketch
+    took too many resources" message. Best-effort: with no web host attached
+    the send goes nowhere and the bleep was the user's notification."""
+    stop_sketch()
+    tulip.stderr_write("AMY overload (%d%% render load): sketch stopped, synth reset" % load_pct)
+    try:
+        import binascii
+        payload = binascii.b2a_base64(str(load_pct).encode('utf-8')).rstrip()
+        tulip.midi_out(bytes([0xF0, 0x00, 0x03, 0x45, 0x4C]) + payload + bytes([0xF7]))
+    except Exception:
+        pass
+
+def report_version(*_args):
+    """Report this firmware's build identity over sysex, framed as
+    F0 00 03 45 'V' <ascii tulip.version()> F7 (e.g. "20260627-abc1234").
+
+    Not yet wired to anything: the web-side firmware-compatibility gate that
+    probed this (via `zP amyboard.report_version()`) was removed because it could
+    false-positive and lock users out. This helper is kept so the probe round-trip
+    can be verified on real hardware before the gate is re-introduced — call it
+    over the wire and confirm the 'V' frame arrives. Best-effort and
+    self-contained: a reporting failure must never break anything. The payload is
+    plain 7-bit ASCII (digits, '-', hex), so no base64 framing is needed."""
+    try:
+        payload = tulip.version().encode('utf-8')
+        tulip.midi_out(bytes([0xF0, 0x00, 0x03, 0x45, 0x56]) + payload + bytes([0xF7]))
+    except Exception:
+        pass
+
+def run_sketch():
+    """Apply knobs from sketch.py, then import it (top-level code runs), start loop()."""
+    global display
+    if display is None:
+        # AMYboard boots init the display in _boot.py; on Tulip we only get
+        # here via world.amyboard.download(), so probe the I2C OLED now. If
+        # none is attached, amyboard.display is a no-op Display, so sketches
+        # that draw still run.
+        try:
+            init_display()
+        except Exception:
+            pass
+    _env_dir = _ensure_current_env_layout()
+    from upysh import cd
+    tulip.stderr_write("cding to %s" % (_env_dir))
+    cd(_env_dir)
+
+    # Restore AMY synth state BEFORE importing sketch.py so user code
+    # can rely on the synth being fully configured.
+    knobs_text = _extract_knobs_from_file(_env_dir + "/sketch.py")
+    tulip.stderr_write("run_sketch: knobs_text=%d bytes" % len(knobs_text))
+    _apply_knobs_text(knobs_text)
+
+    # Clear cached sketch module so we always load fresh from disk
+    # (important after soft_reset which preserves sys.modules).
+    if 'sketch' in sys.modules:
+        del sys.modules['sketch']
+    tulip.stderr_write("import sketch")
+    if _env_dir not in sys.path:
+        sys.path.insert(0, _env_dir)
+    try:
+        import sketch
+    except Exception as e:
+        # Route through stderr_write so the web console sees it alongside the
+        # other diagnostics (stdout may not be wired up in some hosts).
+        tulip.stderr_write("sketch.py load failed: %s: %s" % (type(e).__name__, e))
+        _report_sketch_error(_format_exc_for_report(e))
+        try:
+            sys.print_exception(e)
+        except Exception:
+            pass
+        # Self-heal: if sketch.py is corrupted (SyntaxError from stray bytes,
+        # etc.), overwrite it with the default and try once more so the board
+        # doesn't end up stuck in a bad state across saves/syncs.
+        try:
+            tulip.stderr_write("sketch.py corrupted — restoring default")
+            sketch_path = _env_dir + "/sketch.py"
+            with open(sketch_path, "wb") as f:
+                f.write(DEFAULT_SKETCH_SOURCE.encode("utf-8"))
+            if 'sketch' in sys.modules:
+                del sys.modules['sketch']
+            import sketch
+        except Exception as e2:
+            tulip.stderr_write("default sketch.py load also failed: %s: %s" % (type(e2).__name__, e2))
+            _report_sketch_error(_format_exc_for_report(e2))
+            try:
+                sys.print_exception(e2)
+            except Exception:
+                pass
+            cd(tulip.root_dir() + "user")
+            return
+
+    if hasattr(sketch, 'loop'):
+        _start_sketch_loop(sketch.loop)
+
+    cd(tulip.root_dir() + "user")
+
+
+def _start_sketch_loop(loop_fn):
+    """Schedule loop_fn via TulipSequence (every 32nd note).
+
+    A sketch MUST declare loop(tick).  tick is the AMY sequencer's absolute
+    tick count -- the same clock AMYSequence events and `ticks=` scheduling
+    use, so it can be passed straight back to amy.send(ticks=...) without
+    any conversion or clock read.  The first call is held until a bar
+    boundary (4 beats), so a sketch starts on the downbeat in phase with any
+    AMY-sequenced patterns.
+
+    For 32nd-note counting, divide: `step = tick // amyboard.TICKS_PER_STEP`
+    gives the old bar-locked step index, where step % 32 == 0 is a downbeat.
+
+    The argument is not optional.  This used to accept a zero-argument
+    loop() as well, deciding which by calling loop(step) and catching
+    TypeError -- but MicroPython binds arguments before running the body
+    (objfun.c: INIT_CODESTATE precedes mp_execute_bytecode), so an arity
+    error and a TypeError raised *inside* a one-argument loop are
+    indistinguishable at the call site.  A sketch whose first loop() happened
+    to raise TypeError was permanently misfiled as zero-argument and then
+    failed on every subsequent call.  Requiring the argument removes the
+    guess rather than making it cleverer.
+    """
+    import sequencer
+    global _sketch_seq
+    ticks_per_bar = 4 * sequencer.PPQ
+    _busy = False
+    _started = False
+    _fails = 0
+
+    def _guarded_loop(tick):
+        nonlocal _busy, _started, _fails
+        if _busy:
+            return
+        _busy = True
+        try:
+            if not _started:
+                if tick % ticks_per_bar:
+                    return  # hold loop() until the next downbeat
+                _started = True
+            loop_fn(tick)
+            _fails = 0
+        except Exception as e:
+            # Uniform for every exception type -- deliberately no special
+            # case for TypeError.  An un-migrated `def loop():` raises one,
+            # but so does a real bug inside a correct loop(tick), and (see
+            # above) the two are indistinguishable here.  The traceback
+            # already says "function takes 0 positional arguments but 1 were
+            # given" when that is what happened.
+            _fails += 1
+            print("sketch.loop() error:")
+            sys.print_exception(e)
+            if _fails == _MAX_LOOP_FAILS:  # exactly once, not on every later call
+                # Failing every 32nd note floods the console and starves the
+                # REPL. Nothing has succeeded in _MAX_LOOP_FAILS calls, so
+                # stop rather than keep retrying.
+                print("sketch.loop() failed %d times in a row -- stopping the "
+                      "sketch loop. If loop() takes no argument, it now must: "
+                      "`def loop(tick):` (step = tick // amyboard.TICKS_PER_STEP)"
+                      % _fails)
+                stop_sketch()
+        finally:
+            _busy = False
+
+    _sketch_seq = sequencer.TulipSequence(32, _guarded_loop)
+
+
+def stop_sketch():
+    """Stop the sketch loop."""
+    global _sketch_seq
+    if _sketch_seq is not None:
+        _sketch_seq.clear()
+        _sketch_seq = None
+
+
+def restart_sketch():
+    """Reload and restart sketch.py."""
+    stop_sketch()
+    # Clear the AMY-side sequences the old sketch registered (AMYSequence drum
+    # loops etc.). Hardware factory reset reboots the board so AMY starts
+    # fresh, but sketch restarts on-device and everything in the web simulator
+    # happen in-place -- without this the old sketch's pattern keeps playing
+    # over the new one. Scoped to AMY sequences only (not sequencer.clear(),
+    # whose seq_remove_callbacks would also kill UI TulipSequences like
+    # show_midi). With all entries gone the sequence tag counter can restart
+    # from 0, so repeated sketch saves don't creep toward AMY's max tag.
+    amy.send(reset=amy.RESET_SEQUENCER)
+    if 'sequencer' in sys.modules:
+        sys.modules['sequencer'].AMYSequenceEvent.SEQUENCE_TAG = 0
+    if 'sketch' in sys.modules:
+        del sys.modules['sketch']
+    run_sketch()
+
+
+def get_i2c():
+    global i2c
+    if(i2c is None):
+        try:
+            from machine import I2C
+            i2c = I2C(0, freq=400000)
+        except Exception as e:
+            # Ports without machine.I2C (Tulip Desktop, web): surface this as
+            # OSError so every accessory helper's missing-hardware path treats
+            # it like an absent device instead of crashing the sketch.
+            raise OSError("I2C unavailable: %s" % e)
+    return i2c
+
+def ssd1327_oled():
+    import ssd1327
+    d = ssd1327.SSD1327_I2C(128,128,get_i2c(),addr=0x3d)
+    d.fill(0)
+    return d
+
+def sh1107_oled(rotate=0):
+    import sh1107
+    d = sh1107.SH1107_I2C(128, 128, get_i2c(), address=0x3c, rotate=rotate)
+    d.sleep(False)
+    return d
+
+# Valid screen rotations, in degrees.  The sh1107 driver supports all four.
+DISPLAY_ROTATIONS = (0, 90, 180, 270)
+
+def _display_rotate_path():
+    return tulip.root_dir() + "user/display_rotate"
+
+def display_rotation():
+    """Return the saved display rotation in degrees (one of 0, 90, 180, 270).
+
+    Defaults to 0 when nothing has been saved (or the saved value is bad)."""
+    try:
+        value = int(open(_display_rotate_path()).read().strip())
+    except Exception:
+        return 0
+    return value if value in DISPLAY_ROTATIONS else 0
+
+def set_display_rotation(degrees):
+    """Persist the display rotation and re-initialize the display now.
+
+    ``degrees`` must be one of 0, 90, 180, 270.  The setting is saved under
+    user/ and re-applied automatically on every boot by init_display().  Only
+    the sh1107 OLED is rotated; ssd1327 and the web framebuffer ignore it."""
+    degrees = int(degrees)
+    if degrees not in DISPLAY_ROTATIONS:
+        raise ValueError("display rotation must be one of %s" % (DISPLAY_ROTATIONS,))
+    try:
+        with open(_display_rotate_path(), "w") as f:
+            f.write(str(degrees))
+    except Exception as e:
+        print("amyboard: could not save display rotation:", e)
+    init_display(degrees)  # apply live regardless of whether the save succeeded
+
+def display_refresh():
+    """Legacy helper — calls display.show() if a display exists."""
+    if display is not None:
+        display.show()
+
+def display_startup():
+    display.text("AMYboard!!!!", 0, 0, 255)
+    display.text("TLP " + tulip.version(), 0, 12, 255)
+    display.text("AMY " + amy.version, 0, 24, 255)
+    display.show()
+
+def init_display(rotate=None):
+    global display
+    if rotate is None:
+        rotate = display_rotation()  # use the persisted setting at boot
+    display = Display(rotate=rotate)
+    if display.available:
+        display_startup()
+
+def ads1015_raw(channel=0):
+    import ads1115
+    adc = ads1115.ADS1115(get_i2c())
+    raw = float(adc.read(channel1=channel))
+    return raw
+
+# Calibrate the ADS1015 against the GP8413. Generates a csv file
+def cv_cal(channel=0):
+    vs = [-10,-9,-8,-7,-6,-5,-4,-3,-2,-1.5,-1,-0.5,0,0.5,1,1.5,2,3,4,5,6,7,8,9,10]
+    print("Calibrating...")
+    out = open("cal.csv", "w")
+    for v in vs:
+        cv_out(v, channel=channel)
+        time.sleep(1)
+        raw = ads1015_raw(channel)
+        out.write("%f,%d\n" % (v, raw))
+    out.close()
+    print("Done. Written to cal.csv")
+
+def read_register(addr, reg):
+    get_i2c().writeto(addr, bytes([reg]))
+    b = get_i2c().readfrom(addr, 1)
+    if(b):
+        return int.from_bytes(b, "big")
+    return None
+
+def write_register(addr, reg, val):
+    get_i2c().writeto(addr, bytes([reg, val]))
+
+def init_pcm9211(addr=0x40):
+    registers = [
+        [ 0x40, 0x33 ], # Power down ADC, power down DIR, power down DIT, power down OSC
+        [ 0x40, 0xc0 ], # Normal operation for all
+        [ 0x34, 0x00 ], # Initialize DIR - both biphase amps on, input from RXIN0
+        [ 0x26, 0x01 ], # Main Out is DIR/ADC if no DIR sync (these match power-on default, repeated for clarity).
+        [ 0x6B, 0x00 ], # Main output pins are DIR/ADC AUTO
+        [ 0x30, 0x04 ], # PLL sends 512fs as SCK
+        [ 0x31, 0x0A ], # XTI SCK as 512fs too
+        [ 0x60, 0x44 ], # Initialize PCM9211 DIT to send SPDIF from AUXIN1 through MPO0 (pin15).  MPO1 (pin16) is VOUT (Valid)
+        [ 0x61, 0x20 ], # DIT SCK ratio = 512fs (must match PLL config in 0x30/0x31)
+        [ 0x78, 0x3d ], # MPO0 = 0b1101 = TXOUT, MPO1 = 0b0011 = VOUT
+        [ 0x6F, 0x40 ]  # MPIO_A = CLKST etc / MPIO_B = AUXIN2 / MPIO_C = AUXIN1
+    ]
+    for (reg, val) in registers:
+        write_register(addr, reg, val)
+        r = read_register(addr, reg)
+        if(r==val): 
+            print("Write 0x%02x to 0x%02x OK" % (val, reg))
+        else:
+            print("Write 0x%02x to 0x%02x returned 0x%02x" % (val, reg, r))
+
+def init_gp8413(addr=88):
+    """Select the CV DAC's 5V full-scale output range (register 0x01 = 0x11).
+
+    GP8413 date-code batches differ in their power-up range: 25+ parts
+    (v1.4 boards) default to the 5V full scale the output stage expects,
+    but 26+ parts (v1.5 boards) default to half that, leaving CV out
+    spanning only -10v..0v. 0x11 selects the correct range on both
+    batches (bench-verified a no-op on 25+). The setting is volatile, so
+    this must run every boot before any CV output."""
+    get_i2c().writeto_mem(addr, 0x01, bytes([0x11]))
+
+def set_cv_out(channel=0, synth=1):
+    """Route a synth's audio output to a CV channel instead of speakers.
+
+    channel: 0 for CV1, 1 for CV2
+    synth: AMY synth number whose audio will be sent to this CV output
+
+    The synth's oscillators will be silenced from the audio mix and their
+    waveform sent to the DAC instead. Use amy.send(synth=N, ...) to control
+    the CV waveform shape, frequency, etc.
+
+    Call set_cv_out(channel, synth=0) to clear the mapping.
+
+    No-op on boards without CV hardware (Tulip).
+    """
+    if not cv_capable():
+        return
+    tulip.set_cv_synth(synth, channel + 1 if synth > 0 else 0)
+
+def edit(filename=None):
+    """Open the pye text editor. Pass a filename to edit, or None for a new file."""
+    from pye import pye
+    if filename is not None:
+        pye(filename)
+    else:
+        pye()
+
+def cv_out(volts, channel=0):
+    """Output -10.0v to +10.0v (nominal) on CV1 (channel=0) or 2 (channel=1).
+
+    No-op on boards without CV hardware (Tulip)."""
+    if not cv_capable():
+        return
+    if _vcv():
+        tulip.vcv_cv_out(channel, volts)
+        return
+    addr = 88 # GP8413
+    # With rev1 scaling, 0x0000 -> -10v, 0x7fff -> +10v.
+    # The output stage (TL074, 30K/10K from A3V3) is gain 4 offset -9.9v,
+    # sized for a 5V-full-scale DAC: jack = 4*dac - 9.9. Newer GP8413
+    # batches (v1.5 boards) power up at half that full scale, so
+    # init_gp8413() must have selected the range before writing values.
+    val = int(((volts + 10)/20.0) * 0x8000)
+    if(val < 0):
+        val = 0
+    if(val > 0x7fff):
+        val = 0x7fff
+    b1 = (val & 0xff00) >> 8
+    b0 = (val & 0x00ff)
+    ch = 0x02
+    if(channel == 1):
+        ch = 0x04
+    get_i2c().writeto_mem(addr, ch, bytes([b0,b1]))
+
+def cv_in(channel=0):
+    # Boards without CV hardware (Tulip) read a constant 0.
+    if not cv_capable():
+        return 0.0
+    return tulip.cv_in(channel)
+
+# --- Web encoder emulation helpers (called from JS) ---
+
+def _web_encoder_turn(delta):
+    """Called from JS when the web encoder UI is turned."""
+    global _web_encoder_pos
+    _web_encoder_pos += delta
+
+def _web_encoder_press(state):
+    """Called from JS when the web encoder push button is pressed/released."""
+    global _web_encoder_button
+    _web_encoder_button = state
+
+
+# Adafruit I2C Quad Rotary Encoder Breakout
+# https://www.adafruit.com/product/5752
+# Four rotary encoders with built-in push buttons and one NeoPixel per encoder.
+#  read_encoder(encoder=0)  # reads the current value of the encoder
+#  init_buttons()  # must be called to configure pullup of encoder buttons
+#  read_buttons()  # returns a boolean list of the state of the 4 buttons.
+#  init_neopixels()  # must be called once before driving the on-board NeoPixels.
+#  set_neopixel(index, r, g, b)  # stage a pixel color; call show_neopixels() to latch.
+#  show_neopixels()  # latch pending pixel writes to the LEDs.
+# Code based on abstracting
+# https://github.com/adafruit/Adafruit_CircuitPython_seesaw/blob/main/adafruit_seesaw/seesaw.py
+# and https://github.com/adafruit/Adafruit_CircuitPython_seesaw/blob/main/adafruit_seesaw/neopixel.py.
+#
+# Missing-hardware behaviour: if the Seesaw encoder breakout isn't on the
+# I2C bus (user built an AMYboard with no rotary encoder attached), the
+# helpers below catch the resulting OSError on the first try, cache the
+# offending device address in _seesaw_missing, and silently return safe
+# defaults from then on. This lets sketches like preset_selector.py still
+# import and run cleanly — they just don't see encoder motion or button
+# presses instead of crashing the board at sketch import time.
+
+_seesaw_missing = set()  # addresses we've already probed and confirmed absent
+
+def read_encoder(encoder=0, seesaw_dev=0x49, delay=0.002):
+    """Read the cumulated value of encoder 0..3.
+
+    Returns 0 if the seesaw device isn't present on the I2C bus (see
+    module-level note on missing-hardware behaviour)."""
+    if web():
+        return _web_encoder_pos
+    if _vcv():
+        return tulip.vcv_encoder(encoder)
+    if seesaw_dev in _seesaw_missing:
+        return 0
+    try:
+        i2c = get_i2c()
+        result = bytearray(4)
+        ENCODER_BASE = 0x11
+        ENCODER_POSITION = 0x30
+        i2c.writeto(seesaw_dev, bytes([ENCODER_BASE, ENCODER_POSITION + encoder]))
+        time.sleep(delay)
+        i2c.readfrom_into(seesaw_dev, result)
+        return struct.unpack(">i", result)[0]
+    except OSError:
+        _seesaw_missing.add(seesaw_dev)
+        return 0
+
+def init_buttons(pins=(12, 14, 17, 9), seesaw_dev=0x49):
+    """Setup the seesaw quad encoder button pins to input_pullup.
+
+    Silently no-ops if the seesaw device isn't on the I2C bus."""
+    if web() or _vcv():
+        return
+    if seesaw_dev in _seesaw_missing:
+        return
+    try:
+        mask = 0
+        for p in pins:
+            mask |= (1 << p)
+        mask_bytes = struct.pack('>I', mask)
+        i2c = get_i2c()
+        GPIO_BASE = 0x01
+        GPIO_DIRCLR_BULK = 0x03
+        GPIO_PULLENSET = 0x0B
+        GPIO_BULK_SET = 0x05
+        i2c.writeto(seesaw_dev, bytes([GPIO_BASE, GPIO_DIRCLR_BULK]) + mask_bytes)
+        i2c.writeto(seesaw_dev, bytes([GPIO_BASE, GPIO_PULLENSET]) + mask_bytes)
+        i2c.writeto(seesaw_dev, bytes([GPIO_BASE, GPIO_BULK_SET]) + mask_bytes)
+    except OSError:
+        _seesaw_missing.add(seesaw_dev)
+
+def read_buttons(pins=(12, 14, 17, 9), seesaw_dev=0x49, delay=0.002):
+    """Read the 4 seesaw encoder push buttons.
+
+    Returns [False, False, ...] (one entry per pin) if the seesaw device
+    isn't on the I2C bus."""
+    if web():
+        return [_web_encoder_button] * len(pins)
+    if _vcv():
+        return [tulip.vcv_encoder_button(i) for i in range(len(pins))]
+    if seesaw_dev in _seesaw_missing:
+        return [False] * len(pins)
+    try:
+        i2c = get_i2c()
+        GPIO_BASE = 0x01
+        GPIO_BULK = 0x04
+        i2c.writeto(seesaw_dev, bytes([GPIO_BASE, GPIO_BULK]))
+        time.sleep(delay)
+        buffer = bytearray(4)
+        i2c.readfrom_into(seesaw_dev, buffer)
+        mask = struct.unpack('>I', buffer)[0]
+        result = []
+        for p in pins:
+            state = True
+            if (mask & (1 << p)):
+                # bit set means button not pressed.
+                state = False
+            result.append(state)
+        return result
+    except OSError:
+        _seesaw_missing.add(seesaw_dev)
+        return [False] * len(pins)
+
+def init_neopixels(num=4, pin=18, seesaw_dev=0x49):
+    """Configure the seesaw NeoPixels.
+
+    Defaults match the Adafruit Quad Rotary Encoder Breakout: 4 pixels on
+    seesaw pin 18 at 800 kHz. Call once before set_neopixel()/show_neopixels().
+    Silently no-ops if the seesaw device isn't on the I2C bus."""
+    if web() or _vcv():
+        return
+    if seesaw_dev in _seesaw_missing:
+        return
+    try:
+        i2c = get_i2c()
+        NEOPIXEL_BASE = 0x0E
+        NEOPIXEL_PIN = 0x01
+        NEOPIXEL_SPEED = 0x02
+        NEOPIXEL_BUF_LENGTH = 0x03
+        i2c.writeto(seesaw_dev, bytes([NEOPIXEL_BASE, NEOPIXEL_PIN, pin]))
+        i2c.writeto(seesaw_dev, bytes([NEOPIXEL_BASE, NEOPIXEL_SPEED, 1]))  # 1 = 800 kHz
+        i2c.writeto(seesaw_dev, bytes([NEOPIXEL_BASE, NEOPIXEL_BUF_LENGTH]) + struct.pack('>H', num * 3))
+    except OSError:
+        _seesaw_missing.add(seesaw_dev)
+
+def set_neopixel(index, r, g, b, seesaw_dev=0x49):
+    """Stage seesaw NeoPixel `index` to color (r, g, b) (0..255 each).
+
+    Call show_neopixels() afterwards to latch the staged buffer to the LEDs.
+    Assumes init_neopixels() has already been called. Color order on the
+    wire is GRB (the standard for these Adafruit NeoPixels). Silently
+    no-ops if the seesaw device isn't on the I2C bus."""
+    if web() or _vcv():
+        return
+    if seesaw_dev in _seesaw_missing:
+        return
+    try:
+        i2c = get_i2c()
+        NEOPIXEL_BASE = 0x0E
+        NEOPIXEL_BUF = 0x04
+        i2c.writeto(
+            seesaw_dev,
+            bytes([NEOPIXEL_BASE, NEOPIXEL_BUF]) + struct.pack('>H', index * 3) + bytes([g, r, b]),
+        )
+    except OSError:
+        _seesaw_missing.add(seesaw_dev)
+
+def show_neopixels(seesaw_dev=0x49):
+    """Latch any pending set_neopixel() writes to the LEDs.
+
+    Silently no-ops if the seesaw device isn't on the I2C bus."""
+    if web() or _vcv():
+        return
+    if seesaw_dev in _seesaw_missing:
+        return
+    try:
+        i2c = get_i2c()
+        NEOPIXEL_BASE = 0x0E
+        NEOPIXEL_SHOW = 0x05
+        i2c.writeto(seesaw_dev, bytes([NEOPIXEL_BASE, NEOPIXEL_SHOW]))
+    except OSError:
+        _seesaw_missing.add(seesaw_dev)
+
+# ---------------------------------------------------------------------------
+# Unified rotary-encoder API
+# ---------------------------------------------------------------------------
+# AMYboard works with four different rotary-encoder accessories on the I2C bus,
+# each with its own wire protocol, encoder count, and LED layout:
+#
+#   "adafruit_single" - Adafruit I2C QT Rotary Encoder (0x36-0x3D): 1 enc, 1 LED
+#   "adafruit_quad"   - Adafruit Quad Rotary Encoder Breakout (0x49-0x50): 4 enc, 4 LED
+#   "adafruit_ano"    - Adafruit ANO Navigation Encoder adapter (0x49-0x58): 1 enc,
+#                       5 switches (select/up/left/down/right), no LEDs
+#   "m5stack"         - M5Stack Unit 8Encoder (0x41): 8 encoders, 8 LEDs + a toggle
+#   "web"             - the in-browser simulator's single emulated encoder
+#
+# Rather than make every sketch (and the sketch generator) special-case each one,
+# amyboard.encoder() autodetects whatever is connected and returns an Encoder
+# whose API is identical across all of them:
+#
+#   enc = amyboard.encoder()   # autodetect (finds EVERY attached device)
+#   enc.type                   # "adafruit_quad" | "m5stack" | ... | "multi" | None
+#   enc.devices                # list of (type, i2c_addr) per attached device
+#   enc.encoders               # total number of encoders (int)
+#   enc.buttons                # total number of buttons (>= enc.encoders)
+#   enc.leds                   # total number of addressable LEDs (int)
+#   enc.read(i)                # cumulative position of encoder i, starts at 0
+#   enc.button(i)              # True while button i is held (one per encoder,
+#                              # except the ANO's five: ANO_SELECT/UP/LEFT/...)
+#   enc.led(i, r, g, b)        # light encoder i's LED (0..255 each), applied now
+#   enc.reset(i)               # zero encoder i (omit i to zero them all)
+#   enc.invert(True, i)        # make encoder i count the other way (omit i: all)
+#   enc.switch()               # M5Stack toggle (always False on other devices)
+#
+# Telling boards apart: the quad and the ANO both answer at 0x49, so autodetection
+# reads each seesaw board's firmware product ID rather than trusting its address
+# (see _SEESAW_PRODUCT_IDS). register_seesaw_device() teaches this module about a
+# seesaw board it doesn't know yet, from a sketch, with no firmware rebuild;
+# amyboard.encoder(exclude=(0x49,)) leaves an address out of the scan entirely.
+#
+# Multiple devices: the Adafruit breakouts have address jumpers (single: up to 8
+# boards at 0x36-0x3D, quad: up to 8 at 0x49-0x50, ANO: up to 16 at 0x49-0x58),
+# and autodetection finds every attached device and presents them as ONE Encoder
+# — indices run across devices in
+# a fixed order (M5Stack first, then quads, ANOs, singles, each by ascending I2C
+# address), so e.g. two singles at 0x36 + 0x37 give enc.encoders == 2 with the
+# 0x36 board as encoder 0. Pass addr= (and optionally type=) to bind exactly one
+# specific device instead.
+#
+# Inverted encoders: some encoder hardware revisions count the "wrong" way
+# (clockwise decrements). Pass invert=True to amyboard.encoder() to flip the
+# direction of every read(), or call enc.invert(True, i) for just encoder i.
+#
+# If no encoder is attached (type is None) or the I2C bus errors mid-read, every
+# method returns a safe default, so a sketch written for one device runs unchanged
+# on another device, on the web simulator, or on no hardware at all.
+
+_M5_8ENCODER_ADDR = 0x41
+_ADAFRUIT_QUAD_ADDR = 0x49
+_ADAFRUIT_SINGLE_ADDR = 0x36
+_ADAFRUIT_ANO_ADDR = 0x49
+
+# Each Adafruit breakout has address jumpers, so several boards of each type can
+# share the bus: three jumpers on the single and quad encoders (8 addresses), four
+# on the ANO navigation adapter (16). The ANO defaults to 0x49, the same address
+# as the quad, so address alone can't tell them apart -- see _SEESAW_PRODUCT_IDS.
+_ADAFRUIT_SINGLE_ADDRS = tuple(range(0x36, 0x3E))  # 0x36..0x3D
+_ADAFRUIT_QUAD_ADDRS = tuple(range(0x49, 0x51))    # 0x49..0x50
+_ADAFRUIT_ANO_ADDRS = tuple(range(0x49, 0x59))     # 0x49..0x58
+
+# AMYboard's own I2C chips, never probed as encoder accessories: the ADS1015 CV
+# input ADC (0x48) and the GP8413 CV output DAC (0x58, which falls inside the
+# ANO's jumper range). A seesaw probe writes to a register, so scanning these
+# would poke the board's own CV hardware. An accessory jumpered onto one of these
+# addresses anyway needs an explicit type= plus addr=.
+_ONBOARD_I2C_ADDRS = (0x48, 0x58)
+
+# Names for the addresses we can identify without probing, so scan_i2c() can say
+# what a device is instead of just that something answered.
+_KNOWN_I2C_ADDRS = {
+    0x3C: "OLED display",
+    0x3D: "OLED display",
+    0x41: "M5Stack 8Encoder unit",
+    0x48: "ADS1015 CV input ADC",
+    0x58: "GP8413 CV output DAC",
+}
+
+# Fixed per-device config. seesaw / button_pins / neopixel_pin only apply to the
+# seesaw (Adafruit) devices; the M5Stack unit exposes everything through one
+# register map. A device has one button per encoder unless button_pins says
+# otherwise -- the ANO has one encoder but five switches (select/up/left/down/
+# right), which show up as buttons 0..4 of that device.
+_ENCODER_PROFILES = {
+    "adafruit_single": {"addr": _ADAFRUIT_SINGLE_ADDR, "encoders": 1, "leds": 1,
+                        "seesaw": True, "button_pins": (24,), "neopixel_pin": 6},
+    "adafruit_quad":   {"addr": _ADAFRUIT_QUAD_ADDR, "encoders": 4, "leds": 4,
+                        "seesaw": True, "button_pins": (12, 14, 17, 9),
+                        "neopixel_pin": 18},
+    "adafruit_ano":    {"addr": _ADAFRUIT_ANO_ADDR, "encoders": 1, "leds": 0,
+                        "seesaw": True, "button_pins": (1, 2, 3, 4, 5)},
+    "m5stack":         {"addr": _M5_8ENCODER_ADDR, "encoders": 8, "leds": 8},
+}
+
+# Button indices of the ANO navigation encoder's five switches, in the order its
+# button_pins are listed: enc.button(amyboard.ANO_UP), etc. (offset by the
+# device's first button index if other encoder boards are also attached).
+ANO_SELECT, ANO_UP, ANO_LEFT, ANO_DOWN, ANO_RIGHT = 0, 1, 2, 3, 4
+
+# Hardware-ID codes a seesaw chip can report (SAMD09 and the ATtiny 8x6/8x7/161x
+# parts Adafruit ships). Anything else at a candidate address is some other
+# device — the OLED display lives at 0x3C/0x3D, inside the single-encoder
+# jumper range, and an ADS1115 can sit inside the quad range.
+_SEESAW_HW_IDS = (0x55, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89)
+
+# Product IDs a seesaw board reports in the top half of its version register
+# (Adafruit's own product number). This is the only dependable way to tell the
+# boards apart, because the quad encoder and the ANO navigation encoder both
+# answer at 0x49 by default -- treating an ANO as a quad pulls up and drives
+# seesaw pins that board uses for something else, which reads as a flaky encoder.
+_SEESAW_PRODUCT_IDS = {
+    4991: "adafruit_single",  # I2C QT rotary encoder breakout
+    5880: "adafruit_single",  # ...same board, encoder pre-soldered
+    5752: "adafruit_quad",    # quad rotary encoder breakout
+    5740: "adafruit_ano",     # ANO navigation encoder to I2C adapter
+    6310: "adafruit_ano",     # ...same board, encoder pre-soldered
+}
+
+# Addresses worth probing for a seesaw board, and the type to fall back to for a
+# board at that address whose product ID we don't recognize (firmware older than
+# the version register, or a board newer than this list). Also fixes the order
+# devices appear in the flat index space. register_seesaw_device() prepends here.
+_SEESAW_ADDR_RANGES = [
+    ("adafruit_quad", _ADAFRUIT_QUAD_ADDRS),
+    ("adafruit_ano", _ADAFRUIT_ANO_ADDRS),
+    ("adafruit_single", _ADAFRUIT_SINGLE_ADDRS),
+]
+
+# How many callbacks a button should be held for before Encoder.button_event returns HELD
+_BUTTON_HOLD_STEPS = 6
+
+# Return codes from Encoder.button_event
+PRESS = 1
+HELD = 2
+
+def _seesaw_present(addr, delay=0.008):
+    """True if a device at addr answers the seesaw hardware-ID register."""
+    try:
+        i2c = get_i2c()
+        i2c.writeto(addr, bytes([0x00, 0x01]))  # STATUS_BASE, STATUS_HW_ID
+        time.sleep(delay)
+        return i2c.readfrom(addr, 1)[0] in _SEESAW_HW_IDS
+    except OSError:
+        return False
+
+
+def _seesaw_product(addr, delay=0.008):
+    """Product ID the seesaw firmware at addr reports, or None if it can't be read."""
+    try:
+        i2c = get_i2c()
+        i2c.writeto(addr, bytes([0x00, 0x02]))  # STATUS_BASE, STATUS_VERSION
+        time.sleep(delay)
+        return struct.unpack(">I", i2c.readfrom(addr, 4))[0] >> 16
+    except OSError:
+        return None
+
+
+def register_seesaw_device(type, product_id=None, addrs=None, encoders=1, leds=0,
+                           button_pins=(), neopixel_pin=None):
+    """Teach amyboard about another Adafruit seesaw encoder board at runtime.
+
+    For seesaw accessories this firmware doesn't know about yet -- no firmware
+    rebuild needed, just call this from a sketch before amyboard.encoder():
+
+        amyboard.register_seesaw_device("my_board", product_id=1234,
+                                        addrs=range(0x49, 0x51),
+                                        encoders=2, button_pins=(1, 2))
+        enc = amyboard.encoder()
+
+    product_id is the number the board's seesaw firmware reports (Adafruit's
+    product number, which their simpletest examples print); pass it and
+    autodetection identifies the board positively instead of guessing from its
+    address. addrs is the address range to probe, and takes priority over the
+    built-in ranges for boards whose product ID is unknown. button_pins/
+    neopixel_pin are seesaw pin numbers, as in Adafruit's own example code."""
+    _ENCODER_PROFILES[type] = {
+        "addr": (tuple(addrs)[0] if addrs else None), "encoders": encoders,
+        "leds": leds, "seesaw": True, "button_pins": tuple(button_pins),
+        "neopixel_pin": neopixel_pin,
+    }
+    if product_id is not None:
+        _SEESAW_PRODUCT_IDS[product_id] = type
+    if addrs is not None:
+        _SEESAW_ADDR_RANGES.insert(0, (type, tuple(addrs)))
+
+
+def _detect_encoder_devices(exclude=()):
+    """Scan the I2C bus and return every attached encoder as a (type, addr) list.
+
+    Order is fixed: M5Stack first (distinct address), then the seesaw boards by
+    type (quads, ANOs, singles) and ascending I2C address within each type.
+    Candidate seesaw addresses are verified with a hardware-ID probe, so the OLED
+    display (0x3C/0x3D) or other devices sharing the jumper ranges are never
+    mistaken for encoders, and each board is then identified by the product ID its
+    firmware reports -- the quad and the ANO both live at 0x49 by default.
+    Addresses in exclude are skipped entirely (for a non-encoder seesaw board that
+    would otherwise be probed), as are AMYboard's own CV chips (_ONBOARD_I2C_ADDRS)."""
+    if web():
+        return [("web", None)]
+    if _vcv():
+        return [("vcv", None)]
+    try:
+        present = set(get_i2c().scan())
+    except Exception:
+        return []
+    present -= set(exclude)
+    present -= set(_ONBOARD_I2C_ADDRS)
+    devices = []
+    if _M5_8ENCODER_ADDR in present:
+        devices.append(("m5stack", _M5_8ENCODER_ADDR))
+    found = {}
+    for addr in sorted(present):
+        if not any(addr in addrs for _, addrs in _SEESAW_ADDR_RANGES):
+            continue
+        if not _seesaw_present(addr):
+            continue
+        t = _SEESAW_PRODUCT_IDS.get(_seesaw_product(addr))
+        if t not in _ENCODER_PROFILES:
+            # Unrecognized (or unreadable) product ID: guess from the address.
+            t = None
+            for name, addrs in _SEESAW_ADDR_RANGES:
+                if addr in addrs:
+                    t = name
+                    break
+        if t is not None:
+            found.setdefault(t, []).append(addr)
+    for t, _addrs in _SEESAW_ADDR_RANGES:
+        for addr in found.get(t, []):
+            devices.append((t, addr))
+    return devices
+
+
+def _detect_encoder_type():
+    """Type string of the first attached encoder device, or None."""
+    devices = _detect_encoder_devices()
+    return devices[0][0] if devices else None
+
+
+class Encoder:
+    """One interface to every rotary-encoder accessory that's connected.
+
+    Build via amyboard.encoder() (autodetects all attached devices and flattens
+    them into one index space), or force a single device with type=
+    ("adafruit_single", "adafruit_quad", "adafruit_ano", "m5stack") and/or addr=
+    (its I2C address, for boards moved off the default by address jumpers), or
+    skip specific addresses during autodetect with exclude=(0x49,).
+
+    Most devices have one push button per encoder, so button(i) matches read(i).
+    The ANO navigation encoder is the exception: one encoder, five switches, which
+    appear as buttons 0..4 of that device (amyboard.ANO_SELECT/UP/LEFT/DOWN/RIGHT).
+    enc.buttons is the total button count, which is >= enc.encoders.
+
+    Encoder positions returned by read() are zeroed at construction time, so the
+    first read() of an untouched encoder is 0 no matter what its raw hardware
+    counter happened to be. Buttons are normalized so button(i) is True while
+    held, regardless of each device's underlying active-high/active-low wiring.
+    invert=True (or invert=(False, True, ...) per encoder) flips the direction
+    read() counts, for encoder hardware that increments counterclockwise."""
+
+    def __init__(self, type=None, addr=None, invert=False, exclude=()):
+        if type is None:
+            found = _detect_encoder_devices(exclude=exclude)
+            if addr is not None:
+                # Bind only the device at this address.
+                found = [(t, a) for (t, a) in found if a == addr]
+        elif type in ("web", "vcv"):
+            found = [(type, None)]
+        elif type in _ENCODER_PROFILES:
+            # Forced type: trust the caller, don't require detection (matches
+            # the missing-hardware behaviour of the seesaw helpers above).
+            found = [(type, addr if addr is not None else _ENCODER_PROFILES[type]["addr"])]
+        else:
+            found = []
+
+        self._devs = []
+        self.devices = []  # public: [(type, i2c_addr or None), ...]
+        for t, a in found:
+            if t in ("web", "vcv"):
+                d = {"type": t, "addr": None, "n": 1, "leds": 0, "buttons": 1,
+                     "seesaw": False}
+            else:
+                p = _ENCODER_PROFILES[t]
+                d = {"type": t, "addr": a, "n": p["encoders"], "leds": p["leds"],
+                     "seesaw": p.get("seesaw", False),
+                     "button_pins": p.get("button_pins"),
+                     "neopixel_pin": p.get("neopixel_pin")}
+                # One button per encoder unless the profile lists its own pins.
+                d["buttons"] = len(d["button_pins"]) if d["button_pins"] else d["n"]
+                if d["seesaw"]:
+                    init_buttons(pins=d["button_pins"], seesaw_dev=a)
+                    # Only touch the NeoPixel registers on boards that have them:
+                    # the ANO doesn't, and its seesaw uses that pin for something
+                    # else.
+                    if d["leds"]:
+                        init_neopixels(num=d["leds"], pin=d["neopixel_pin"], seesaw_dev=a)
+            self._devs.append(d)
+            self.devices.append((t, a))
+
+        self.encoders = sum(d["n"] for d in self._devs)
+        self.buttons = sum(d["buttons"] for d in self._devs)
+        self.button_held_steps = [0] * self.buttons
+        self.button_events_queue = []
+        self.leds = sum(d["leds"] for d in self._devs)
+        types = set(t for t, _ in self.devices)
+        # type stays a plain string for single-type setups; "multi" when mixed.
+        self.type = self.devices[0][0] if len(types) == 1 else ("multi" if types else None)
+
+        # Flatten per-device encoder/button/LED indices into one global index space.
+        self._map = [(d, j) for d in self._devs for j in range(d["n"])]
+        self._button_map = [(d, j) for d in self._devs for j in range(d["buttons"])]
+        self._led_map = [(d, j) for d in self._devs for j in range(d["leds"])]
+
+        if isinstance(invert, (tuple, list)):
+            self._invert = [bool(invert[i]) if i < len(invert) else False
+                            for i in range(self.encoders)]
+        else:
+            self._invert = [bool(invert)] * self.encoders
+
+        # Snapshot each encoder's raw counter so read() starts at 0.
+        self._offset = [self._raw_read(i) for i in range(self.encoders)]
+
+    # -- raw, offset-free per-device reads --
+
+    def _raw_read(self, i):
+        d, j = self._map[i]
+        t = d["type"]
+        if t == "web":
+            return _web_encoder_pos
+        if t == "vcv":
+            return tulip.vcv_encoder(j)
+        if d["seesaw"]:
+            return read_encoder(j, seesaw_dev=d["addr"])
+        if t == "m5stack":
+            try:
+                i2c = get_i2c()
+                i2c.writeto(d["addr"], bytes([4 * j]))  # counter reg = 4*j, <i (LE)
+                return struct.unpack("<i", i2c.readfrom(d["addr"], 4))[0]
+            except OSError:
+                return 0
+        return 0
+
+    # -- public API --
+
+    def read(self, i=0):
+        """Cumulative position of encoder i (0-based), starting at 0."""
+        if not (0 <= i < self.encoders):
+            return 0
+        pos = self._raw_read(i) - self._offset[i]
+        return -pos if self._invert[i] else pos
+
+    def invert(self, invert=True, i=None):
+        """Make encoder i count the other way (omit i to set every encoder).
+
+        invert(True) flips a clockwise turn to decrement; invert(False) restores
+        the hardware's native direction. Sets the state, doesn't toggle it."""
+        if i is None:
+            self._invert = [bool(invert)] * self.encoders
+        elif 0 <= i < self.encoders:
+            self._invert[i] = bool(invert)
+
+    def button(self, i=0):
+        """True while button i is held down.
+
+        Button i is encoder i's push button on devices with one button per
+        encoder; see the class docstring for the ANO's five switches."""
+        if not (0 <= i < self.buttons):
+            return False
+        d, j = self._button_map[i]
+        t = d["type"]
+        if t == "web":
+            return _web_encoder_button
+        if t == "vcv":
+            return tulip.vcv_encoder_button(j)
+        if d["seesaw"]:
+            return read_buttons(pins=(d["button_pins"][j],), seesaw_dev=d["addr"])[0]
+        if t == "m5stack":
+            try:
+                i2c = get_i2c()
+                i2c.writeto(d["addr"], bytes([0x50 + j]))  # button reg, active-low
+                return i2c.readfrom(d["addr"], 1)[0] == 0  # 0 == pressed
+            except OSError:
+                return False
+        return False
+
+    def poll_button_events(self):
+        """Stateful layer that returns a list of button events (button, PRESS/HOLD)."""
+        for i in range(self.buttons):
+            button_down = self.button(i)
+            if button_down:
+                if self.button_held_steps[i] < _BUTTON_HOLD_STEPS:
+                    self.button_held_steps[i] += 1
+                    if self.button_held_steps[i] == _BUTTON_HOLD_STEPS:
+                        self.button_events_queue.append((i, HELD))
+            else:
+                # Button is up
+                if self.button_held_steps[i] > 0:
+                    # Button was down
+                    if self.button_held_steps[i] < _BUTTON_HOLD_STEPS:
+                        self.button_events_queue.append((i, PRESS))
+                    self.button_held_steps[i] = 0
+
+    def button_event(self, encoder=None):
+        """Pull one event from button event stack, either for encoder, or for all."""
+        result = None
+        for i, event in enumerate(self.button_events_queue):
+            if encoder is None or event[0] == encoder:
+                result = event
+                del self.button_events_queue[i]
+                break
+        return result
+
+    def led(self, i, r, g, b):
+        """Set LED i to (r, g, b), each 0..255. Applied immediately."""
+        if not (0 <= i < self.leds):
+            return
+        d, j = self._led_map[i]
+        t = d["type"]
+        if d["seesaw"]:
+            set_neopixel(j, r, g, b, seesaw_dev=d["addr"])
+            show_neopixels(seesaw_dev=d["addr"])
+        elif t == "m5stack":
+            try:
+                get_i2c().writeto_mem(d["addr"], 0x70 + 3 * j, bytes([r, g, b]))  # RGB
+            except OSError:
+                pass
+
+    def reset(self, i=None, value=0):
+        """Zero encoder i back to value (or 0) (omit i to zero every encoder)."""
+        if i is None:
+            self._offset = [self._raw_read(i) - value for i in range(self.encoders)]
+        elif 0 <= i < self.encoders:
+            self._offset[i] = self._raw_read(i) - value
+
+    def switch(self):
+        """M5Stack 8Encoder toggle-switch state (always False on other devices)."""
+        for d in self._devs:
+            if d["type"] == "m5stack":
+                try:
+                    i2c = get_i2c()
+                    i2c.writeto(d["addr"], bytes([0x60]))  # switch reg
+                    return i2c.readfrom(d["addr"], 1)[0] != 0
+                except OSError:
+                    return False
+        return False
+
+
+def encoder(type=None, addr=None, invert=False, exclude=()):
+    """Autodetect the connected rotary-encoder accessories and return an Encoder.
+
+    Finds EVERY attached device — the Adafruit single (0x36-0x3D), quad
+    (0x49-0x50) and ANO navigation (0x49-0x58) seesaw breakouts (multiple boards
+    via their address jumpers) and the M5Stack 8Encoder unit (0x41) — or the web
+    simulator's emulated encoder, and presents them as one Encoder with a flat
+    index space. Pass type= ("adafruit_single", "adafruit_quad", "adafruit_ano",
+    "m5stack") and/or addr= to bind one specific device instead, or exclude= a
+    list of I2C addresses to leave out of the scan. invert=True flips the counting
+    direction for hardware that increments counterclockwise (per-encoder:
+    enc.invert(True, i)). See the Encoder class for the unified
+    read()/button()/led()/reset() API, and register_seesaw_device() to add a
+    seesaw board this firmware doesn't know about."""
+    return Encoder(type=type, addr=addr, invert=invert, exclude=exclude)
+
+
+def scan_i2c(verbose=True):
+    """Report every device on the I2C bus and how autodetection reads it.
+
+    Run this when an accessory isn't picked up, or is picked up as the wrong
+    board. For each address it prints the device we can identify, and for seesaw
+    accessories the firmware product ID the chip reports plus the encoder type
+    amyboard.encoder() would bind it to -- the quad breakout and the ANO
+    navigation encoder both ship at 0x49, so the address alone proves nothing.
+
+        >>> amyboard.scan_i2c()
+        0x3c  -                OLED display
+        0x49  adafruit_ano     seesaw board, firmware product 5740
+        0x58  -                GP8413 CV output DAC (on-board, not probed)
+
+    Returns [(addr, encoder_type or None, description), ...]."""
+    try:
+        present = sorted(get_i2c().scan())
+    except Exception as e:
+        if verbose:
+            print("I2C bus unavailable: %s" % e)
+        return []
+    detected = {}
+    for t, a in _detect_encoder_devices():
+        detected[a] = t
+    rows = []
+    for addr in present:
+        t = detected.get(addr)
+        desc = _KNOWN_I2C_ADDRS.get(addr, "")
+        if addr in _ONBOARD_I2C_ADDRS:
+            desc = (desc or "on-board device") + " (on-board, not probed)"
+        else:
+            candidate = False
+            for _name, addrs in _SEESAW_ADDR_RANGES:
+                if addr in addrs:
+                    candidate = True
+                    break
+            if candidate and _seesaw_present(addr):
+                product = _seesaw_product(addr)
+                desc = "seesaw board, firmware product %s" % (
+                    product if product else "unknown")
+        if not desc:
+            desc = "unidentified device"
+        rows.append((addr, t, desc))
+        if verbose:
+            print("0x%02x  %-16s %s" % (addr, t if t else "-", desc))
+    return rows
+
+
+def monitor_encoders():
+    """Show status of encoders on display."""
+    # You can run this in a loop to get continuous display of encoders
+    # e.g.
+    # >>> amyboard.init_buttons()
+    # >>> for _ in range(100):
+    # ...     amyboard.monitor_encoders()
+    # ...
+    bar_top = 20
+    bar_height = 8
+    bar_space = 12
+    bar_center = 64
+    buttons = read_buttons()
+    for encoder in range(4):
+        width = read_encoder(encoder)
+        top = bar_top + encoder * bar_space
+        # Clear existing bar
+        display.fill_rect(0, top, 128, bar_space, 0)
+        # Draw new bar
+        if width < 0:
+            center = bar_center + width
+            width = -width
+        else:
+            center = bar_center
+        display.fill_rect(center, top, width, bar_height, 255)
+        if buttons[encoder]:
+            # Small box at the left.
+            display.fill_rect(2, top + 2, 2, 2, 255)
+    display.show()
+
+# To see when MIDI CCs are being changed, add to your sketch.py:
+# amyboard.show_midi_ccs()
+class ShowMidiCcs:
+    """Class to manage state of deferred-display MIDI CC change tracker."""
+    def __init__(self, ticks_to_display=20, top_row=4, bar_height=4):
+        self.channel = None
+        self.code = None
+        self.value = None
+        self.ticks_to_display = ticks_to_display
+        self.ticks_to_live = 0
+        # Where on display to place result
+        self.top_row = top_row
+        self.bar_height = bar_height
+
+    def midi_hook(self, midi):
+        """Attached to midi callback."""
+        if midi and (midi[0] & 0xF0) == 0xB0:
+            # We have a control code.
+            self.channel = 1 + (midi[0] & 0x0F)  # MIDI channels are numbered 1..16.
+            self.code = midi[1]
+            self.value = midi[2]
+
+    def update(self):
+        if self.channel is not None:
+            display.message("CH %02d CC %03d" % (self.channel, self.code), self.top_row)
+            display.fill_rect(0, (self.top_row + 1) * display.LINEHEIGHT + 1, self.value, self.bar_height, 1)
+            display.fill_rect(self.value, (self.top_row + 1) * display.LINEHEIGHT + 1, display.WIDTH - self.value, self.bar_height, 0)
+            display.show()
+            self.channel = None  # Mark update as handled
+            self.ticks_to_live = self.ticks_to_display  # Reset blanking counter
+        elif self.ticks_to_live:
+            self.ticks_to_live -= 1
+            if self.ticks_to_live == 0:
+                # Clear the old display.
+                display.fill_rect(0, self.top_row * display.LINEHEIGHT, display.WIDTH, 2 * display.LINEHEIGHT, 0)
+                display.show()
+
+def show_midi_ccs(ticks_to_display=20, top_row=4, bar_height=4):
+    """Setup hook to show last MIDI CC on the display."""
+    import midi
+    import sequencer
+    show_midi_obj = ShowMidiCcs(ticks_to_display, top_row, bar_height)
+    midi.add_callback(show_midi_obj.midi_hook)
+    seq = sequencer.TulipSequence(32, lambda x: show_midi_obj.update())
+    return seq, show_midi_obj
+    
+
+WAVEFORM_MAX = 32767.0
+
+def draw_waveform():
+    """Plot some of the output waveform on the oled."""
+    # e.g.
+    # >>> for _ in range(100):
+    # ...     amyboard.draw_waveform()
+    waveform = struct.unpack('<' + (512 * 'h'), tulip.amy_get_output_buffer())
+    waveform_top = 0
+    waveform_left = 0
+    waveform_height = 64
+    waveform_width = 128
+    display.fill_rect(waveform_left, waveform_top,
+                      waveform_width, waveform_height, 0)
+    # center the largest sample
+    max_value = 0
+    max_value_pos = 0
+    for x in range(len(waveform) // 2 - waveform_width):
+        pos = waveform_width // 2 + x
+        value = (waveform[2 * pos] + waveform[2 * pos + 1])
+        if value > max_value:
+            max_value = value
+            max_value_pos = pos
+    # Pos marks middle; shift it to the left edge
+    pos = max_value_pos - waveform_width // 2
+    for x in range(waveform_width):
+        value = (waveform[2 * (pos + x)] + waveform[2 * (pos + x) + 1]) // 2
+        y = waveform_top + int((waveform_height // 2)
+                               * (1.0 - value / WAVEFORM_MAX))
+        if x > 0:
+            display.line(waveform_left + last_x, last_y,
+                         waveform_left + x, y, 15)
+        last_x = x
+        last_y = y
+    display.show()
+

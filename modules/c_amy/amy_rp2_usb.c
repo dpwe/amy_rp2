@@ -131,6 +131,7 @@ static bool pump_tick(repeating_timer_t *rt) {
         mp_sched_schedule_node(&pump_node, pump);
     }
     amy_rp2_sysex_tick();
+    amy_rp2_tulip_tick();
     return true;
 }
 

@@ -355,6 +355,7 @@ static void (*next_midi_input_hook)(uint8_t *, uint16_t, uint8_t) = NULL;
 
 static void count_midi_input(uint8_t *bytes, uint16_t len, uint8_t is_sysex) {
     if (next_midi_input_hook) next_midi_input_hook(bytes, len, is_sysex);
+    amy_rp2_tulip_midi_in(bytes, len, is_sysex);  // for Python's midi.add_callback()
     if (is_sysex) return;
     midi_msgs++;
     uint32_t m = 0;
@@ -452,6 +453,7 @@ bool amy_rp2_start(amy_config_t c) {
     // If startup wedges (e.g. AMY touching a failed allocation), reboot rather
     // than hang USB; the crumbs say how far it got.
     amy_rp2_sysex_install_hooks(&c);
+    amy_rp2_tulip_install_hooks(&c);
     watchdog_enable(5000, true);
     CRUMB(1);
     amy_start(c);

@@ -66,6 +66,12 @@ void amy_rp2_sysex_tick(void);
 uint32_t amy_rp2_sysex_dropped(void);
 void amy_rp2_sysex_install_hooks(amy_config_t *c);
 
+// _tulip support (amy_rp2_tulip.c): sequencer / overload hooks, the MIDI-in
+// queue for Python, and the core 0 tick that schedules their Python callbacks.
+void amy_rp2_tulip_install_hooks(amy_config_t *c);
+void amy_rp2_tulip_midi_in(uint8_t *bytes, uint16_t len, uint8_t is_sysex);
+void amy_rp2_tulip_tick(void);
+
 // Allocation stats (amy_rp2_mem.c).
 void amy_rp2_mem_stats(uint32_t *sram_used, uint32_t *sram_free, uint32_t *psram_used,
                        uint32_t *psram_size, uint32_t *failures);

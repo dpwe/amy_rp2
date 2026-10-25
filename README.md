@@ -13,18 +13,40 @@ amy.send(synth=1, note=60, vel=1)
 AMY's own Python package is frozen into the firmware unchanged; it finds the
 `c_amy` C module here the same way it finds the CPython one.
 
-## Starting AMY at boot
+## Starting at boot: AMY and amyboard.py
 
-Nothing starts AMY by itself yet. To have it running from power-on (needed for
-amyboard.com/editor to find the board), install the provided `boot.py`:
+Install the provided `boot.py` once:
 
 ```bash
 mpremote cp board/boot.py :boot.py
 ```
 
-It runs `amy.live()` on every boot and soft reset (so `mpremote` sessions keep AMY
-running too), and catches errors so the REPL stays reachable. Remove it with
+On every boot and soft reset it runs `amyboard_boot.boot()` (frozen in): it starts
+AMY on core 1, then does what an AMYboard does at startup (tulipcc's
+`_boot.py`): `amyboard.ensure_user_environment()`, `init_display()`,
+`start_amy()` (default patches, then `/user/current/sketch.py` with its
+`loop(tick)`), and hooks MIDI input up to `midi.add_callback()`. Each step reports
+failures and carries on, so the REPL always comes up. Remove it with
 `mpremote rm :boot.py`.
+
+## AMYboard firmware Python (amyboard.py)
+
+The real `amyboard.py` runs here, with `tulip.py`, `midi.py`, `synth.py`,
+`sequencer.py`, `arpegg.py`, `patches.py`, `tulip_queue.py` and `upysh.py`, all
+frozen unchanged from tulipcc. They live in `py/tulipcc/`; refresh them with
+`scripts/sync_tulipcc_py.sh` (copies from a tulipcc checkout's `origin/main` and
+records the commit in `py/tulipcc/TULIPCC_COMMIT`).
+
+What they need from Tulip's C `_tulip` module comes from `py/_tulip.py`, backed by
+`c_amy` for the parts driven by AMY on core 1 (`modules/c_amy/amy_rp2_tulip.c`):
+sequencer callbacks (`seq_add_callback`, which runs `loop(tick)`), MIDI input for
+Python (`midi_callback` / `midi_in`), the overload callback and
+`bootloader_mode()`. AMY's hooks only mark these due on core 1; the 1 ms core-0
+timer schedules the Python callbacks.
+
+The board presents as `AMYBOARD_VCV` (`tulip.board()`): AMYboard firmware with AMY
+already running and no physical display, encoders or CV, which is amyboard.py's
+VCV Rack path. Those hardware calls are no-ops here.
 
 ## USB MIDI
 
@@ -57,12 +79,10 @@ The editor talks to an AMYboard with sysex frames `F0 00 03 45 ... F7` over MIDI
 
 Every frame except `zI` and `zB` is acknowledged with `F0 00 03 45 'A' 'K' F7`
 once it has been handled. The editor's own commands are mostly
-`zP import amyboard; amyboard.<...>()`. For now an interim `amyboard` module
-(`py/amyboard.py`, frozen in) answers them: `report_version()` replies
-`V <YYYYMMDD-hash>` (`c_amy.version()`, the build date and commit), and after
-"Write to your AMYboard" the new `/user/current/sketch.py` is run, with errors
-reported back to the editor. Only a sketch's top-level code runs; `loop(tick)`
-waits for the real `amyboard.py`.
+`zP import amyboard; amyboard.<...>()`, answered by the real `amyboard.py`
+(below): `report_version()` replies `V <YYYYMMDD-hash>` (`c_amy.version()`, the
+build date and commit), and "Write to your AMYboard" writes and restarts
+`/user/current/sketch.py`, reporting errors back to the editor.
 
 `spss_host.py` speaks the same protocol from the host: `test` runs ping, exec,
 file write and read-back; `write SRC DEST`, `read PATH` and `exec CODE` do one
@@ -160,6 +180,7 @@ Test scripts (run with `mpremote run <script>`):
 | `test_echo.py` | turns on echo while a note plays; delay lines that don't fit in SRAM go to the PSRAM pool |
 | `test_echo_psram.py` | asks for a 3 s echo (more than the PSRAM pool holds); AMY should log the failure and keep running |
 | `spss_host.py test` | the editor's sysex protocol: `zI` ping, `zP` exec, `zT` file write and `zD` read-back, a wire message |
+| `test_sketch_loop.py` | a sketch whose `loop(tick)` counts calls and plays notes; write it with `spss_host.py write test_sketch_loop.py /user/current/sketch.py` then `spss_host.py exec "import amyboard; amyboard.environment_transfer_done()"` and check `sketch.calls` (~14/s at 108 BPM) |
 | `spss_host.py editor` | the editor's "Write to your AMYboard" sequence: version probe, `sketch.py` transfer, restart; then a sketch with an error, which should be reported |
 | `test_gp5.py` | raw activity on the MIDI-in pin, independent of the UART; if it shows no edges while you play, the problem is upstream of the chip |
 
@@ -171,5 +192,7 @@ flash is written).
 
 MIDI in works over both UART1 and USB: notes play the default synths (Juno on
 channel 1, DX7 on 2, drums on 10).
+
+Sketches from amyboard.com/editor run with `loop(tick)`.
 
 Not done yet: audio input, MCLK output, splitting rendering across both cores.

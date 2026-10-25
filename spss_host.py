@@ -77,8 +77,10 @@ def editor_write(b, sketch_text):
     b.exec('import amyboard; amyboard.report_version()')
     f, ms = b._wait(lambda f: f[:1] == b'V', 3)
     print('version probe:', ('V %s (%.0f ms)' % (f[1:].decode(), ms)) if f else 'NO V REPLY')
-    b.write('/user/current/sketch.py', sketch_text.encode())
+    # The board restarts the sketch as soon as sketch.py arrives (its transfer-done
+    # hook), so an error report can come before the editor's own restart below.
     b.frames.clear()
+    b.write('/user/current/sketch.py', sketch_text.encode())
     b.exec('import amyboard; amyboard.environment_transfer_done()')
     f, _ = b._wait(lambda f: f[:1] == b'X' and len(f) > 1, 1.5)
     if f:

@@ -253,6 +253,11 @@ static mp_obj_t c_amy_stack_unused(void) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(c_amy_stack_unused_obj, c_amy_stack_unused);
 
+// _tulip support, defined in amy_rp2_tulip.c.
+extern const mp_obj_fun_builtin_fixed_t amy_rp2_seq_add_callback_obj, amy_rp2_seq_remove_callback_obj,
+    amy_rp2_seq_remove_callbacks_obj, amy_rp2_seq_ticks_obj, amy_rp2_midi_callback_obj, amy_rp2_midi_in_obj,
+    amy_rp2_sysex_in_obj, amy_rp2_overload_callback_obj, amy_rp2_bootloader_mode_obj;
+
 static const mp_rom_map_elem_t c_amy_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR___name__), MP_ROM_QSTR(MP_QSTR_c_amy) },
     { MP_ROM_QSTR(MP_QSTR_live), MP_ROM_PTR(&c_amy_live_obj) },
@@ -275,6 +280,15 @@ static const mp_rom_map_elem_t c_amy_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_peak), MP_ROM_PTR(&c_amy_peak_obj) },
     { MP_ROM_QSTR(MP_QSTR_version), MP_ROM_PTR(&c_amy_version_obj) },
     { MP_ROM_QSTR(MP_QSTR_midi_out), MP_ROM_PTR(&c_amy_midi_out_obj) },
+    { MP_ROM_QSTR(MP_QSTR_seq_add_callback), MP_ROM_PTR(&amy_rp2_seq_add_callback_obj) },
+    { MP_ROM_QSTR(MP_QSTR_seq_remove_callback), MP_ROM_PTR(&amy_rp2_seq_remove_callback_obj) },
+    { MP_ROM_QSTR(MP_QSTR_seq_remove_callbacks), MP_ROM_PTR(&amy_rp2_seq_remove_callbacks_obj) },
+    { MP_ROM_QSTR(MP_QSTR_seq_ticks), MP_ROM_PTR(&amy_rp2_seq_ticks_obj) },
+    { MP_ROM_QSTR(MP_QSTR_midi_callback), MP_ROM_PTR(&amy_rp2_midi_callback_obj) },
+    { MP_ROM_QSTR(MP_QSTR_midi_in), MP_ROM_PTR(&amy_rp2_midi_in_obj) },
+    { MP_ROM_QSTR(MP_QSTR_sysex_in), MP_ROM_PTR(&amy_rp2_sysex_in_obj) },
+    { MP_ROM_QSTR(MP_QSTR_amy_overload_callback), MP_ROM_PTR(&amy_rp2_overload_callback_obj) },
+    { MP_ROM_QSTR(MP_QSTR_bootloader_mode), MP_ROM_PTR(&amy_rp2_bootloader_mode_obj) },
 };
 static MP_DEFINE_CONST_DICT(c_amy_module_globals, c_amy_module_globals_table);
 
