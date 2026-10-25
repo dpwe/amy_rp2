@@ -34,6 +34,7 @@ target_sources(usermod_c_amy INTERFACE
     ${CMAKE_CURRENT_LIST_DIR}/amy_rp2.c
     ${CMAKE_CURRENT_LIST_DIR}/amy_rp2_mem.c
     ${CMAKE_CURRENT_LIST_DIR}/amy_rp2_usb.c
+    ${CMAKE_CURRENT_LIST_DIR}/amy_rp2_sysex.c
     ${CMAKE_CURRENT_LIST_DIR}/newlib_locks.c
     ${AMY_RP2_AMY_SOURCES}
 )
@@ -63,5 +64,15 @@ target_compile_definitions(usermod_c_amy INTERFACE
     CFG_TUD_MIDI_EP_BUFSIZE=64
 )
 target_link_options(usermod_c_amy INTERFACE -Wl,--wrap=tud_descriptor_configuration_cb)
+
+# c_amy.version(): "YYYYMMDD-<git hash>" (configure date and this repo's
+# commit), the form amyboard.com/editor expects from report_version().
+string(TIMESTAMP AMY_RP2_BUILD_DATE "%Y%m%d")
+execute_process(COMMAND git -C ${CMAKE_CURRENT_LIST_DIR} rev-parse --short HEAD
+    OUTPUT_VARIABLE AMY_RP2_GIT_HASH OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+if(NOT AMY_RP2_GIT_HASH)
+    set(AMY_RP2_GIT_HASH "unknown")
+endif()
+target_compile_definitions(usermod_c_amy INTERFACE AMY_RP2_VERSION="${AMY_RP2_BUILD_DATE}-${AMY_RP2_GIT_HASH}")
 
 target_link_libraries(usermod INTERFACE usermod_c_amy)

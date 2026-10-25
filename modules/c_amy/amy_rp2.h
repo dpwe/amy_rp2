@@ -19,6 +19,9 @@
 #define AMY_RP2_CMD_BLEEP       3  // decimal start time, amy_bleep()
 #define AMY_RP2_CMD_MIDI_USB    4  // 3-byte padded USB/Web MIDI events (usb=1)
 
+// Largest SPSS sysex payload handled (and largest command-ring entry).
+#define AMY_RP2_SYSEX_FRAME_MAX 4096
+
 // Start AMY on core 1 with config c (audio must be AMY_AUDIO_IS_I2S or NONE).
 // Returns false if core 1 could not be started.
 bool amy_rp2_start(amy_config_t c);
@@ -35,6 +38,9 @@ uint32_t amy_rp2_core1_stack_unused(void);
 // Largest |output sample| since the last call (0..32767).
 uint32_t amy_rp2_take_peak(void);
 
+// Wait (up to timeout_ms) until core 1 has processed everything queued so far.
+bool amy_rp2_wait_idle(uint32_t timeout_ms);
+
 // Number of blocks DMA had to restart after running dry (audio underruns).
 uint32_t amy_rp2_underruns(void);
 
@@ -50,6 +56,15 @@ size_t amy_rp2_log_take(char *out, size_t max);
 void amy_rp2_usb_init(void);
 void amy_rp2_usb_midi_write(const uint8_t *bytes, size_t len);
 uint32_t amy_rp2_usb_midi_dropped(void);
+
+// SPSS sysex (amy_rp2_sysex.c): core 1 queues complete F0 00 03 45 ... F7
+// payloads; a core 0 timer tick schedules their handling; AMY's file / exec /
+// reboot hooks.  zB0 (reboot, skip sketch) leaves this in watchdog scratch[3].
+#define AMY_RP2_SKIP_SKETCH_MAGIC 0x5B0057C0u
+bool amy_rp2_sysex_push(const uint8_t *payload, size_t len);
+void amy_rp2_sysex_tick(void);
+uint32_t amy_rp2_sysex_dropped(void);
+void amy_rp2_sysex_install_hooks(amy_config_t *c);
 
 // Allocation stats (amy_rp2_mem.c).
 void amy_rp2_mem_stats(uint32_t *sram_used, uint32_t *sram_free, uint32_t *psram_used,

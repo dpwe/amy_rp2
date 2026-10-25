@@ -48,7 +48,7 @@ static uint8_t ring[RING_SIZE];
 static volatile uint32_t ring_head = 0;  // advanced by core 0 only
 static volatile uint32_t ring_tail = 0;  // advanced by core 1 only
 
-static char cmd_buf[MAX_MESSAGE_LEN + 1];
+static char cmd_buf[AMY_RP2_SYSEX_FRAME_MAX + 1];
 
 // ------------- run state -------------
 
@@ -85,6 +85,85 @@ uart_inst_t *rp_get_uart(int8_t index) {
     return NULL;
 }
 
+// ------------- SPSS sysex scanner (core 1) -------------
+// Pulls complete F0 00 03 45 ... F7 frames out of a MIDI byte stream for
+// amy_rp2_sysex.c (handled on core 0, like AMYboard's MicroPython path);
+// everything else, including other sysex, goes on to AMY's parser.
+
+enum { SCAN_PASS, SCAN_HDR, SCAN_CAPTURE, SCAN_DROP };
+
+typedef struct {
+    uint8_t state;
+    uint8_t hdr_len;
+    uint8_t hdr[3];
+    uint16_t len;
+    uint8_t buf[AMY_RP2_SYSEX_FRAME_MAX];
+} spss_scan_t;
+
+// PSRAM: SRAM is fully budgeted; state is reset in amy_rp2_start().
+static spss_scan_t uart_scan __attribute__((section(".psram_uninitialised.amy_uart_scan")));
+static spss_scan_t ring_scan __attribute__((section(".psram_uninitialised.amy_ring_scan")));
+
+static void spss_feed(spss_scan_t *sc, const uint8_t *data, size_t n) {
+    static const uint8_t spss_id[3] = { 0x00, 0x03, 0x45 };
+    uint8_t pass[64];
+    size_t np = 0;
+#define PASS(b) do { pass[np++] = (b); if (np == sizeof(pass)) { convert_midi_bytes_to_messages(pass, np, 0); np = 0; } } while (0)
+    for (size_t i = 0; i < n; ++i) {
+        uint8_t b = data[i];
+        if (b >= 0xF8) {  // real-time bytes may sit anywhere, even inside sysex
+            PASS(b);
+            continue;
+        }
+        switch (sc->state) {
+            case SCAN_PASS:
+                if (b == 0xF0) {
+                    sc->state = SCAN_HDR;
+                    sc->hdr_len = 0;
+                } else {
+                    PASS(b);
+                }
+                break;
+            case SCAN_HDR:
+                if (!(b & 0x80) && b == spss_id[sc->hdr_len]) {
+                    sc->hdr[sc->hdr_len++] = b;
+                    if (sc->hdr_len == 3) {
+                        sc->state = SCAN_CAPTURE;
+                        sc->len = 0;
+                    }
+                } else {
+                    // Not ours: give AMY the sysex start and what we held back.
+                    PASS(0xF0);
+                    for (int k = 0; k < sc->hdr_len; ++k) PASS(sc->hdr[k]);
+                    sc->state = SCAN_PASS;
+                    --i;  // reconsider b in pass state
+                }
+                break;
+            case SCAN_CAPTURE:
+                if (b == 0xF7) {
+                    amy_rp2_sysex_push(sc->buf, sc->len);
+                    sc->state = SCAN_PASS;
+                } else if (b & 0x80) {
+                    sc->state = SCAN_PASS;  // truncated frame: drop it
+                    --i;
+                } else if (sc->len < sizeof(sc->buf)) {
+                    sc->buf[sc->len++] = b;
+                } else {
+                    sc->state = SCAN_DROP;  // too long: discard to the end
+                }
+                break;
+            case SCAN_DROP:
+                if (b & 0x80) {
+                    sc->state = SCAN_PASS;
+                    if (b != 0xF7) --i;
+                }
+                break;
+        }
+    }
+    if (np) convert_midi_bytes_to_messages(pass, np, 0);
+#undef PASS
+}
+
 static void poll_midi_uart(void) {
     if (!(amy_global.config.midi & AMY_MIDI_IS_UART)) return;
     uart_inst_t *u = rp_get_uart(amy_global.config.midi_uart);
@@ -95,7 +174,7 @@ static void poll_midi_uart(void) {
     }
     if (n) {
         midi_uart_bytes += n;
-        convert_midi_bytes_to_messages(bytes, n, 0);
+        spss_feed(&uart_scan, bytes, n);
     }
 }
 
@@ -109,8 +188,6 @@ static void drain_ring(void) {
             cmd_buf[i] = ring[(t + RING_HDR + i) & RING_MASK];
         }
         cmd_buf[len] = '\0';
-        __dmb();
-        ring_tail = t + RING_HDR + len;
         switch (type) {
             case AMY_RP2_CMD_WIRE:
                 amy_add_message(cmd_buf);
@@ -119,13 +196,19 @@ static void drain_ring(void) {
                 amy_send_wire_from_sysex(cmd_buf);
                 break;
             case AMY_RP2_CMD_MIDI:
+                spss_feed(&ring_scan, (uint8_t *)cmd_buf, len);
+                break;
             case AMY_RP2_CMD_MIDI_USB:
-                convert_midi_bytes_to_messages((uint8_t *)cmd_buf, len, type == AMY_RP2_CMD_MIDI_USB);
+                convert_midi_bytes_to_messages((uint8_t *)cmd_buf, len, 1);
                 break;
             case AMY_RP2_CMD_BLEEP:
                 amy_bleep(strtoul(cmd_buf, NULL, 10));
                 break;
         }
+        // Only now is the entry done with: an empty ring means "all processed"
+        // (amy_rp2_wait_idle relies on that).
+        __dmb();
+        ring_tail = t + RING_HDR + len;
     }
 }
 
@@ -364,9 +447,11 @@ bool amy_rp2_start(amy_config_t c) {
     ring_head = ring_tail = 0;
     underruns = 0;
     midi_uart_bytes = midi_msgs = midi_last_msg = 0;
+    uart_scan.state = ring_scan.state = SCAN_PASS;
     amy_rp2_usb_init();
     // If startup wedges (e.g. AMY touching a failed allocation), reboot rather
     // than hang USB; the crumbs say how far it got.
+    amy_rp2_sysex_install_hooks(&c);
     watchdog_enable(5000, true);
     CRUMB(1);
     amy_start(c);
@@ -403,7 +488,7 @@ void amy_rp2_soft_reset(void) {
 }
 
 bool amy_rp2_push(uint8_t type, const uint8_t *data, size_t len, uint32_t timeout_ms) {
-    if (!amy_rp2_started || len > MAX_MESSAGE_LEN) return false;
+    if (!amy_rp2_started || len > AMY_RP2_SYSEX_FRAME_MAX) return false;
     size_t need = RING_HDR + len;
     absolute_time_t deadline = make_timeout_time_ms(timeout_ms);
     while (RING_SIZE - (ring_head - ring_tail) < need) {
@@ -419,6 +504,15 @@ bool amy_rp2_push(uint8_t type, const uint8_t *data, size_t len, uint32_t timeou
     }
     __dmb();  // payload visible before the new head
     ring_head = h + need;
+    return true;
+}
+
+bool amy_rp2_wait_idle(uint32_t timeout_ms) {
+    absolute_time_t deadline = make_timeout_time_ms(timeout_ms);
+    while (ring_tail != ring_head) {
+        if (time_reached(deadline)) return false;
+        tight_loop_contents();
+    }
     return true;
 }
 

@@ -8,3 +8,6 @@ package(
     base_path="$(MPY_DIR)/../amy",
     opt=2,
 )
+
+# Interim amyboard module for amyboard.com/editor (until the real amyboard.py).
+module("amyboard.py", base_path="$(BOARD_DIR)/../../py")

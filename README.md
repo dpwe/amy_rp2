@@ -41,6 +41,33 @@ macOS remembers MIDI device names by USB identity. If this board previously show
 up under another name, delete that entry in Audio MIDI Setup (Window > Show MIDI
 Studio, with the board unplugged) and plug it back in.
 
+## amyboard.com/editor protocol
+
+The editor talks to an AMYboard with sysex frames `F0 00 03 45 ... F7` over MIDI
+(USB or UART). This board handles them like AMYboard's firmware does:
+
+| Frame | Handling |
+|---|---|
+| `zI` | replies `OK` (the editor's "is a board there?" ping) |
+| `zT<path>,<size>` + base64 chunks | writes the file to the board's filesystem (creating folders) |
+| `zD<path>` | sends the file back as base64 sysex; `zD` alone dumps AMY's state |
+| `zP<python>` | runs the Python on the board |
+| `zB0` / `zB1` / `zB2` | reboot (skip sketch / normal / BOOTSEL) |
+| anything else | an ordinary AMY message |
+
+Every frame except `zI` and `zB` is acknowledged with `F0 00 03 45 'A' 'K' F7`
+once it has been handled. The editor's own commands are mostly
+`zP import amyboard; amyboard.<...>()`. For now an interim `amyboard` module
+(`py/amyboard.py`, frozen in) answers them: `report_version()` replies
+`V <YYYYMMDD-hash>` (`c_amy.version()`, the build date and commit), and after
+"Write to your AMYboard" the new `/user/current/sketch.py` is run, with errors
+reported back to the editor. Only a sketch's top-level code runs; `loop(tick)`
+waits for the real `amyboard.py`.
+
+`spss_host.py` speaks the same protocol from the host: `test` runs ping, exec,
+file write and read-back; `write SRC DEST`, `read PATH` and `exec CODE` do one
+thing each.
+
 ## Pins (defaults)
 
 | Signal | GPIO |
@@ -87,6 +114,13 @@ picotool load -x build-PIMORONI_PICO_PLUS2/firmware.uf2
   runs on core 0 from MicroPython's scheduler: received MIDI goes into the ring to
   core 1, and AMY's output is queued and written to TinyUSB by a callback a 1 ms
   timer schedules on core 0.
+- **Editor sysex**: a scanner on core 1 (`amy_rp2.c`) pulls complete SPSS frames
+  out of all MIDI input and queues them to core 0, where `amy_rp2_sysex.c` handles
+  them in a MicroPython scheduler callback: file transfers, `zP`, `zD <file>`,
+  `zI` and `zB` there (they need the filesystem or the VM and only touch AMY's
+  transfer state), everything else on core 1 via the command ring, waiting until
+  core 1 has processed it before the `AK`. AMY's file, exec, transfer-done and
+  reboot hooks are implemented there too.
 - **I2S** uses the PIO program bundled with AMY (`src/pico-audio/audio_i2s.pio.h`)
   with double-buffered DMA. No MCLK is generated, which the PCM5102 doesn't need.
 - **Memory**: the 8 MB PSRAM becomes the MicroPython heap; AMY mallocs from a 352 KB
@@ -125,6 +159,8 @@ Test scripts (run with `mpremote run <script>`):
 | `test_usb_midi.sh` | run on the host: starts AMY, plays notes and a sysex + 16-note burst into the board's USB MIDI port (`send_usb_midi.py`), checks the `zI` → `OK` reply (`ping_usb_midi.py`); needs `pip install mido python-rtmidi` |
 | `test_echo.py` | turns on echo while a note plays; delay lines that don't fit in SRAM go to the PSRAM pool |
 | `test_echo_psram.py` | asks for a 3 s echo (more than the PSRAM pool holds); AMY should log the failure and keep running |
+| `spss_host.py test` | the editor's sysex protocol: `zI` ping, `zP` exec, `zT` file write and `zD` read-back, a wire message |
+| `spss_host.py editor` | the editor's "Write to your AMYboard" sequence: version probe, `sketch.py` transfer, restart; then a sketch with an error, which should be reported |
 | `test_gp5.py` | raw activity on the MIDI-in pin, independent of the UART; if it shows no edges while you play, the problem is upstream of the chip |
 
 ## Status

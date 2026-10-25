@@ -232,6 +232,22 @@ static mp_obj_t c_amy_peak(void) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(c_amy_peak_obj, c_amy_peak);
 
+static mp_obj_t c_amy_version(void) {
+    return mp_obj_new_str(AMY_RP2_VERSION, strlen(AMY_RP2_VERSION));
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(c_amy_version_obj, c_amy_version);
+
+extern void midi_out(uint8_t *bytes, uint16_t len);
+
+static mp_obj_t c_amy_midi_out(mp_obj_t data) {
+    // Send raw MIDI (e.g. sysex replies to the editor) out of USB and UART.
+    mp_buffer_info_t buf;
+    mp_get_buffer_raise(data, &buf, MP_BUFFER_READ);
+    midi_out(buf.buf, buf.len);
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(c_amy_midi_out_obj, c_amy_midi_out);
+
 static mp_obj_t c_amy_stack_unused(void) {
     return mp_obj_new_int_from_uint(amy_rp2_core1_stack_unused());
 }
@@ -257,6 +273,8 @@ static const mp_rom_map_elem_t c_amy_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_log), MP_ROM_PTR(&c_amy_log_obj) },
     { MP_ROM_QSTR(MP_QSTR_stack_unused), MP_ROM_PTR(&c_amy_stack_unused_obj) },
     { MP_ROM_QSTR(MP_QSTR_peak), MP_ROM_PTR(&c_amy_peak_obj) },
+    { MP_ROM_QSTR(MP_QSTR_version), MP_ROM_PTR(&c_amy_version_obj) },
+    { MP_ROM_QSTR(MP_QSTR_midi_out), MP_ROM_PTR(&c_amy_midi_out_obj) },
 };
 static MP_DEFINE_CONST_DICT(c_amy_module_globals, c_amy_module_globals_table);
 

@@ -10,7 +10,8 @@
 //           into the command ring to core 1, like any other AMY input.
 // MIDI out: midi_out() runs on core 1 (or core 0); bytes go into tx_ring, and
 //           a 1 ms timer on core 0 schedules a MicroPython callback that
-//           writes them to TinyUSB from tud_task()'s own context.
+//           writes them to TinyUSB from tud_task()'s own context.  The same
+//           tick schedules SPSS sysex handling (amy_rp2_sysex.c).
 
 // MicroPython's QSTR scan (NO_QSTR) preprocesses this without TinyUSB's
 // include paths; nothing here defines Python-visible names, so skip it.
@@ -24,6 +25,7 @@
 #include "mp_usbd.h"
 
 #include "hardware/sync.h"
+#include "pico/platform.h"
 #include "pico/time.h"
 
 #include "amy_rp2.h"
@@ -70,10 +72,10 @@ void tud_midi_rx_cb(uint8_t itf) {
 
 // ------------- MIDI out -------------
 
-#define TX_SIZE 2048  // power of two
+#define TX_SIZE 16384  // power of two; big enough for an AMY state dump from core 1
 #define TX_MASK (TX_SIZE - 1)
 
-static uint8_t tx_ring[TX_SIZE];
+static uint8_t tx_ring[TX_SIZE] __attribute__((section(".psram_uninitialised.amy_tx_ring")));
 static volatile uint32_t tx_head = 0;  // producers, under tx_lock
 static volatile uint32_t tx_tail = 0;  // core 0 pump only
 static spin_lock_t *tx_lock = NULL;
@@ -83,8 +85,19 @@ static mp_sched_node_t pump_node;
 static repeating_timer_t pump_timer;
 static bool pump_timer_running = false;
 
+static void pump(mp_sched_node_t *node);
+
 void amy_rp2_usb_midi_write(const uint8_t *bytes, size_t len) {
-    if (tx_lock == NULL || !tud_midi_mounted()) return;
+    if (tx_lock == NULL || !tud_midi_mounted() || len > TX_SIZE) return;
+    if (get_core_num() == 0) {
+        // Core 0 writers run in tud_task()'s context (the sysex handler, e.g.
+        // a zD file dump), so instead of dropping, drain to TinyUSB until it fits.
+        absolute_time_t deadline = make_timeout_time_ms(500);
+        while (TX_SIZE - (tx_head - tx_tail) < len && !time_reached(deadline)) {
+            pump(NULL);
+            tud_task_ext(0, false);
+        }
+    }
     uint32_t save = spin_lock_blocking(tx_lock);
     if (TX_SIZE - (tx_head - tx_tail) >= len) {
         for (size_t i = 0; i < len; ++i) {
@@ -117,6 +130,7 @@ static bool pump_tick(repeating_timer_t *rt) {
     if (tx_tail != tx_head) {
         mp_sched_schedule_node(&pump_node, pump);
     }
+    amy_rp2_sysex_tick();
     return true;
 }
 
