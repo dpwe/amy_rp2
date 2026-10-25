@@ -28,8 +28,21 @@ bool amy_rp2_running(void);
 // Returns false on timeout or if AMY isn't running.
 bool amy_rp2_push(uint8_t type, const uint8_t *data, size_t len, uint32_t timeout_ms);
 
+// Bytes of core 1's stack never touched so far (high-water mark).
+uint32_t amy_rp2_core1_stack_unused(void);
+
+// Largest |output sample| since the last call (0..32767).
+uint32_t amy_rp2_take_peak(void);
+
 // Number of blocks DMA had to restart after running dry (audio underruns).
 uint32_t amy_rp2_underruns(void);
+
+// MIDI input counters; channel/synth masks have bit n set for channel n (1..16).
+void amy_rp2_midi_debug(uint32_t *uart_bytes, uint32_t *msgs, uint32_t *last_msg,
+                        uint32_t *active_channels, uint32_t *synths);
+
+// Take (and clear) what AMY has written to stderr.
+size_t amy_rp2_log_take(char *out, size_t max);
 
 // Allocation stats (amy_rp2_mem.c).
 void amy_rp2_mem_stats(uint32_t *sram_used, uint32_t *sram_free, uint32_t *psram_used,

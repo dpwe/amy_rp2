@@ -198,6 +198,35 @@ static mp_obj_t c_amy_crumbs(void) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(c_amy_crumbs_obj, c_amy_crumbs);
 
+static mp_obj_t c_amy_midi_debug(void) {
+    // (uart_bytes, messages, last_message, active_channel_mask, synth_mask)
+    uint32_t v[5];
+    amy_rp2_midi_debug(&v[0], &v[1], &v[2], &v[3], &v[4]);
+    mp_obj_t t[5];
+    for (int i = 0; i < 5; ++i) t[i] = mp_obj_new_int_from_uint(v[i]);
+    return mp_obj_new_tuple(5, t);
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(c_amy_midi_debug_obj, c_amy_midi_debug);
+
+static mp_obj_t c_amy_log(void) {
+    // What AMY has printed to stderr since the last call.
+    static char buf[4096];
+    size_t n = amy_rp2_log_take(buf, sizeof(buf));
+    return mp_obj_new_str(buf, n);
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(c_amy_log_obj, c_amy_log);
+
+static mp_obj_t c_amy_peak(void) {
+    // Largest |output sample| (0..32767) since the last call.
+    return mp_obj_new_int_from_uint(amy_rp2_take_peak());
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(c_amy_peak_obj, c_amy_peak);
+
+static mp_obj_t c_amy_stack_unused(void) {
+    return mp_obj_new_int_from_uint(amy_rp2_core1_stack_unused());
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(c_amy_stack_unused_obj, c_amy_stack_unused);
+
 static const mp_rom_map_elem_t c_amy_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR___name__), MP_ROM_QSTR(MP_QSTR_c_amy) },
     { MP_ROM_QSTR(MP_QSTR_live), MP_ROM_PTR(&c_amy_live_obj) },
@@ -214,6 +243,10 @@ static const mp_rom_map_elem_t c_amy_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_underruns), MP_ROM_PTR(&c_amy_underruns_obj) },
     { MP_ROM_QSTR(MP_QSTR_mem), MP_ROM_PTR(&c_amy_mem_obj) },
     { MP_ROM_QSTR(MP_QSTR_crumbs), MP_ROM_PTR(&c_amy_crumbs_obj) },
+    { MP_ROM_QSTR(MP_QSTR_midi_debug), MP_ROM_PTR(&c_amy_midi_debug_obj) },
+    { MP_ROM_QSTR(MP_QSTR_log), MP_ROM_PTR(&c_amy_log_obj) },
+    { MP_ROM_QSTR(MP_QSTR_stack_unused), MP_ROM_PTR(&c_amy_stack_unused_obj) },
+    { MP_ROM_QSTR(MP_QSTR_peak), MP_ROM_PTR(&c_amy_peak_obj) },
 };
 static MP_DEFINE_CONST_DICT(c_amy_module_globals, c_amy_module_globals_table);
 

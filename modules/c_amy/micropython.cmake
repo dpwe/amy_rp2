@@ -47,7 +47,8 @@ target_compile_definitions(usermod_c_amy INTERFACE AMY_HOST_MIDI=1 MALLOC_CAPS_D
 
 # AMY is third-party to MicroPython's warning policy; build it optimised.
 # Its free() calls go to amy_rp2_free(), which knows about the PSRAM pool
-# (amy_rp2_mem.c).  pico_malloc already owns --wrap=free.
-set_source_files_properties(${AMY_RP2_AMY_SOURCES} PROPERTIES COMPILE_OPTIONS "-w;-O2;-Dfree=amy_rp2_free")
+# (amy_rp2_mem.c).  pico_malloc already owns --wrap=free.  Its fprintf()s go to
+# amy_rp2_fprintf(), readable as c_amy.log().
+set_source_files_properties(${AMY_RP2_AMY_SOURCES} PROPERTIES COMPILE_OPTIONS "-w;-O2;-Dfree=amy_rp2_free;-Dfprintf=amy_rp2_fprintf")
 
 target_link_libraries(usermod INTERFACE usermod_c_amy)

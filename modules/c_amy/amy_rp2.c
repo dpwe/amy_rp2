@@ -12,6 +12,8 @@
 // #2201: after multicore_reset_core1() the lockout victim still reads as
 // initialised, and MicroPython's flash writes would then wait forever for it.)
 
+#include <stdarg.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -27,6 +29,10 @@
 #include "hardware/watchdog.h"
 #include "pico/multicore.h"
 #include "pico/time.h"
+
+#ifndef MP_ARRAY_SIZE
+#define MP_ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#endif
 
 #include "pico-audio/audio_i2s.pio.h"
 
@@ -52,7 +58,9 @@ static volatile bool run_requested = false;
 static volatile int core1_state = CORE1_PARKED;
 static volatile bool amy_rp2_started = false;
 
-static uint32_t core1_stack[16 * 1024 / sizeof(uint32_t)];
+// The ABI wants SP 8-byte aligned (varargs doubles, e.g. printf("%f"), read
+// garbage otherwise); a bare uint32_t array only guarantees 4.
+static uint32_t core1_stack[16 * 1024 / sizeof(uint32_t)] __attribute__((aligned(16)));
 
 // ------------- I2S out: PIO + double-buffered DMA -------------
 
@@ -64,6 +72,12 @@ static uint32_t dma_buf[2][AMY_BLOCK_SIZE];  // (L << 16) | R per frame
 static int dma_next = 0;
 static bool dma_primed = false;
 static volatile uint32_t underruns = 0;
+static volatile uint32_t out_peak = 0;  // max |sample| since last amy_rp2_take_peak()
+
+// MIDI input counters, for c_amy.midi_debug().
+static volatile uint32_t midi_uart_bytes = 0;
+static volatile uint32_t midi_msgs = 0;
+static volatile uint32_t midi_last_msg = 0;  // up to 3 bytes, big-endian
 
 uart_inst_t *rp_get_uart(int8_t index) {
     if (index == 0) return uart0;
@@ -79,7 +93,10 @@ static void poll_midi_uart(void) {
     while (n < sizeof(bytes) && uart_is_readable(u)) {
         bytes[n++] = uart_getc(u);
     }
-    if (n) convert_midi_bytes_to_messages(bytes, n, 0);
+    if (n) {
+        midi_uart_bytes += n;
+        convert_midi_bytes_to_messages(bytes, n, 0);
+    }
 }
 
 static void drain_ring(void) {
@@ -188,9 +205,14 @@ int16_t *amy_render_audio(void) {
 size_t amy_i2s_write(const uint8_t *buffer, size_t nbytes) {
     const int16_t *s = (const int16_t *)buffer;
     uint32_t *d = dma_buf[dma_next];
+    uint32_t peak = out_peak;
     for (int i = 0; i < AMY_BLOCK_SIZE; ++i) {
         d[i] = ((uint32_t)(uint16_t)s[2 * i] << 16) | (uint16_t)s[2 * i + 1];
+        uint32_t l = abs(s[2 * i]), r = abs(s[2 * i + 1]);
+        if (l > peak) peak = l;
+        if (r > peak) peak = r;
     }
+    out_peak = peak;
     if (dma_primed && !dma_channel_is_busy(i2s_dma)) {
         underruns++;
     }
@@ -240,6 +262,71 @@ void midi_out(uint8_t *bytes, uint16_t len) {
     }
 }
 
+// amy_default_synths() installs its own input hook, so ours goes in after
+// amy_start() and passes everything on to whatever was there.
+static void (*next_midi_input_hook)(uint8_t *, uint16_t, uint8_t) = NULL;
+
+static void count_midi_input(uint8_t *bytes, uint16_t len, uint8_t is_sysex) {
+    if (next_midi_input_hook) next_midi_input_hook(bytes, len, is_sysex);
+    if (is_sysex) return;
+    midi_msgs++;
+    uint32_t m = 0;
+    for (int i = 0; i < len && i < 3; ++i) m = (m << 8) | bytes[i];
+    midi_last_msg = m;
+}
+
+extern bool _midi_channel_active[];
+extern bool instrument_number_exists(int instrument_number, const char *tag);
+
+void amy_rp2_midi_debug(uint32_t *uart_bytes, uint32_t *msgs, uint32_t *last_msg,
+                        uint32_t *active_channels, uint32_t *synths) {
+    *uart_bytes = midi_uart_bytes;
+    *msgs = midi_msgs;
+    *last_msg = midi_last_msg;
+    // Bit n set = MIDI channel / synth n (1..16).
+    uint32_t a = 0, e = 0;
+    for (int ch = 1; ch <= 16; ++ch) {
+        if (_midi_channel_active[ch]) a |= 1u << ch;
+        if (instrument_number_exists(ch, NULL)) e |= 1u << ch;
+    }
+    *active_channels = a;
+    *synths = e;
+}
+
+// ------------- AMY's stderr -------------
+// AMY's sources are built with -Dfprintf=amy_rp2_fprintf; its messages land
+// here for c_amy.log() instead of vanishing into newlib's stdio.
+
+#define LOG_SIZE 4096
+static char log_buf[LOG_SIZE];
+static volatile uint32_t log_len = 0;
+
+int amy_rp2_fprintf(FILE *f, const char *fmt, ...) {
+    (void)f;
+    char line[160];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+    if (n < 0) return n;
+    if (n >= (int)sizeof(line)) n = sizeof(line) - 1;
+    uint32_t len = log_len;
+    if (len + n > LOG_SIZE) {
+        len = 0;  // full: start over rather than grow
+    }
+    memcpy(log_buf + len, line, n);
+    log_len = len + n;
+    return n;
+}
+
+size_t amy_rp2_log_take(char *out, size_t max) {
+    uint32_t len = log_len;
+    if (len > max) len = max;
+    memcpy(out, log_buf, len);
+    log_len = 0;
+    return len;
+}
+
 // ------------- core 1 -------------
 
 static void core1_main(void) {
@@ -272,14 +359,19 @@ bool amy_rp2_start(amy_config_t c) {
     c.platform.multithread = 0;
     ring_head = ring_tail = 0;
     underruns = 0;
+    midi_uart_bytes = midi_msgs = midi_last_msg = 0;
     // If startup wedges (e.g. AMY touching a failed allocation), reboot rather
     // than hang USB; the crumbs say how far it got.
     watchdog_enable(5000, true);
     CRUMB(1);
     amy_start(c);
     CRUMB(4);
+    next_midi_input_hook = amy_global.config.amy_external_midi_input_hook;
+    amy_global.config.amy_external_midi_input_hook = count_midi_input;
     amy_rp2_started = true;
     if (!core1_launched) {
+        // Paint the stack so amy_rp2_core1_stack_unused() can find the high-water mark.
+        for (size_t i = 0; i < MP_ARRAY_SIZE(core1_stack); ++i) core1_stack[i] = 0xDEADBEEF;
         multicore_launch_core1_with_stack(core1_main, core1_stack, sizeof(core1_stack));
         core1_launched = true;
     }
@@ -323,6 +415,18 @@ bool amy_rp2_push(uint8_t type, const uint8_t *data, size_t len, uint32_t timeou
     __dmb();  // payload visible before the new head
     ring_head = h + need;
     return true;
+}
+
+uint32_t amy_rp2_core1_stack_unused(void) {
+    size_t i = 0;
+    while (i < MP_ARRAY_SIZE(core1_stack) && core1_stack[i] == 0xDEADBEEF) ++i;
+    return i * sizeof(uint32_t);
+}
+
+uint32_t amy_rp2_take_peak(void) {
+    uint32_t p = out_peak;
+    out_peak = 0;
+    return p;
 }
 
 uint32_t amy_rp2_underruns(void) {

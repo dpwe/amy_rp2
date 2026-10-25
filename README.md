@@ -59,6 +59,9 @@ picotool load -x build-PIMORONI_PICO_PLUS2/firmware.uf2
   (`modules/c_amy/amy_rp2_mem.c`).
 - **`_thread` is disabled** (`MICROPY_PY_THREAD=0`): AMY owns core 1, and with
   threading off MicroPython's flash-write lockout correctly pauses it.
+- **Core 1's stack is 16-byte aligned.** The ARM ABI needs an 8-byte-aligned SP; with
+  only 4, varargs doubles go wrong, so `printf("%f")` on core 1 printed garbage. AMY
+  formats MIDI velocities that way, so every MIDI note-on arrived with velocity 0.
 - AMY is built with `AMY_HOST_MIDI` (this module supplies the MIDI device layer) and
   `MALLOC_CAPS_DEFINED`; nothing in the AMY or MicroPython trees is modified.
 
@@ -67,17 +70,32 @@ picotool load -x build-PIMORONI_PICO_PLUS2/firmware.uf2
 | Call | Returns |
 |---|---|
 | `c_amy.underruns()` | audio blocks where DMA ran dry |
+| `c_amy.peak()` | largest \|output sample\| (0..32767) since the last call |
+| `c_amy.midi_debug()` | `(uart_bytes, messages, last_message, active_channel_mask, synth_mask)`; masks have bit *n* set for MIDI channel / synth *n* |
+| `c_amy.log()` | what AMY has printed to stderr since the last call (its `fprintf`s are redirected here) |
 | `c_amy.mem()` | `(sram_used, sram_free, psram_used, psram_pool, failed_allocs)` |
+| `c_amy.stack_unused()` | bytes of core 1's 16 KB stack never touched (high-water mark) |
 | `c_amy.crumbs()` | startup breadcrumbs; `amy.live()` arms a 5 s watchdog, so a startup hang reboots the board and this shows where it stopped |
 
-Test scripts: `test_chord.py` (render load, underruns), `test_fs.py` (flash writes
-while playing), `test_pins.py` (samples the I2S pins on-chip, independent of wiring).
-Run with `mpremote run <script>`.
+Test scripts (run with `mpremote run <script>`):
+
+| Script | Checks |
+|---|---|
+| `test_chord.py` | render load and underruns for a three-voice chord |
+| `test_fs.py` | filesystem writes while audio plays |
+| `test_pins.py` | samples the I2S pins on-chip, independent of the DAC wiring |
+| `test_levels.py` | output peak for `amy.send()` vs injected MIDI notes (should match) |
+| `test_midi_inject.py` | injects MIDI through the parser UART MIDI uses; PASS/FAIL from DOUT activity |
+| `test_midi_keyboard.py` | play a keyboard into GP5 while it runs: bytes, messages and output peak every 2 s |
+| `test_gp5.py` | raw activity on the MIDI-in pin, independent of the UART; if it shows no edges while you play, the problem is upstream of the chip |
 
 ## Status
 
 Measured at the default 150 MHz: idle render load 6.5%, three Juno voices 34%, no
 underruns. Writing to the filesystem costs about one dropout (core 1 is paused while
 flash is written).
+
+Serial MIDI in works: a keyboard on UART1 plays the default synths (Juno on
+channel 1, DX7 on 2, drums on 10).
 
 Not done yet: USB MIDI, audio input, MCLK output, splitting rendering across both cores.
