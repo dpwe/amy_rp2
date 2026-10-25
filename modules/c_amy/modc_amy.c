@@ -130,17 +130,21 @@ static mp_obj_t c_amy_send_wire_from_sysex(mp_obj_t msg) {
 static MP_DEFINE_CONST_FUN_OBJ_1(c_amy_send_wire_from_sysex_obj, c_amy_send_wire_from_sysex);
 
 static mp_obj_t c_amy_inject_midi_bytes(size_t n_args, const mp_obj_t *args) {
-    // (data, usb) -- usb is accepted for CPython compatibility; always "from USB".
+    // (data, usb=0) as in the CPython binding: a raw MIDI byte stream, or with
+    // usb=1, 3-byte-padded events (the parser stops after one message per call).
     mp_buffer_info_t buf;
     mp_get_buffer_raise(args[0], &buf, MP_BUFFER_READ);
-    push(AMY_RP2_CMD_MIDI, buf.buf, buf.len);
+    bool usb = n_args > 1 && mp_obj_is_true(args[1]);
+    push(usb ? AMY_RP2_CMD_MIDI_USB : AMY_RP2_CMD_MIDI, buf.buf, buf.len);
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(c_amy_inject_midi_bytes_obj, 1, 2, c_amy_inject_midi_bytes);
 
 static mp_obj_t c_amy_process_single_midi_byte(size_t n_args, const mp_obj_t *args) {
+    // (byte, from_web_or_usb=1) as in the CPython binding.
     uint8_t b = mp_obj_get_int(args[0]);
-    push(AMY_RP2_CMD_MIDI, &b, 1);
+    bool usb = n_args < 2 || mp_obj_is_true(args[1]);
+    push(usb ? AMY_RP2_CMD_MIDI_USB : AMY_RP2_CMD_MIDI, &b, 1);
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(c_amy_process_single_midi_byte_obj, 1, 2, c_amy_process_single_midi_byte);

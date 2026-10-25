@@ -15,8 +15,9 @@
 // Ring entry types.
 #define AMY_RP2_CMD_WIRE        0  // wire message, amy_add_message()
 #define AMY_RP2_CMD_WIRE_SYSEX  1  // wire message, amy_send_wire_from_sysex()
-#define AMY_RP2_CMD_MIDI        2  // raw MIDI bytes, convert_midi_bytes_to_messages()
+#define AMY_RP2_CMD_MIDI        2  // raw MIDI byte stream, convert_midi_bytes_to_messages(usb=0)
 #define AMY_RP2_CMD_BLEEP       3  // decimal start time, amy_bleep()
+#define AMY_RP2_CMD_MIDI_USB    4  // 3-byte padded USB/Web MIDI events (usb=1)
 
 // Start AMY on core 1 with config c (audio must be AMY_AUDIO_IS_I2S or NONE).
 // Returns false if core 1 could not be started.

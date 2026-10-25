@@ -119,7 +119,8 @@ static void drain_ring(void) {
                 amy_send_wire_from_sysex(cmd_buf);
                 break;
             case AMY_RP2_CMD_MIDI:
-                convert_midi_bytes_to_messages((uint8_t *)cmd_buf, len, 1);
+            case AMY_RP2_CMD_MIDI_USB:
+                convert_midi_bytes_to_messages((uint8_t *)cmd_buf, len, type == AMY_RP2_CMD_MIDI_USB);
                 break;
             case AMY_RP2_CMD_BLEEP:
                 amy_bleep(strtoul(cmd_buf, NULL, 10));

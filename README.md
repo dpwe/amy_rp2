@@ -13,6 +13,23 @@ amy.send(synth=1, note=60, vel=1)
 AMY's own Python package is frozen into the firmware unchanged; it finds the
 `c_amy` C module here the same way it finds the CPython one.
 
+## USB MIDI
+
+```python
+import amy, amy_usb_midi
+amy.live()
+amy_usb_midi.start()     # board reappears as "AMY RP2350" MIDI port + REPL serial port
+```
+
+`start()` re-enumerates USB as a composite device: the usual REPL serial port plus
+a class-compliant MIDI port (no driver needed on macOS, Linux or Windows). Incoming
+USB MIDI goes to the same AMY parser as UART MIDI. Runtime USB configuration is
+dropped on soft reset, so put those lines in `boot.py` or `main.py` to have USB MIDI
+every boot. When connecting with `mpremote` after `start()`, use
+`mpremote resume ...`, since a soft reset would remove the MIDI port again.
+
+USB MIDI is input only for now; AMY's MIDI output goes to the UART.
+
 ## Pins (defaults)
 
 | Signal | GPIO |
@@ -52,6 +69,9 @@ picotool load -x build-PIMORONI_PICO_PLUS2/firmware.uf2
   I2S DMA. Core 0 (the MicroPython VM) only pushes wire messages into a lock-free
   single-producer/single-consumer ring (`modules/c_amy/amy_rp2.c`), so AMY's locks,
   which are no-ops on bare pico-sdk, are never needed.
+- **USB MIDI** (`py/amy_usb_midi.py`) uses micropython-lib's `usb-device-midi` class
+  (frozen in), with a 256-byte receive buffer, its OUT transfer restarted after each
+  drain, and each batch unpacked into one MIDI byte stream for AMY.
 - **I2S** uses the PIO program bundled with AMY (`src/pico-audio/audio_i2s.pio.h`)
   with double-buffered DMA. No MCLK is generated, which the PCM5102 doesn't need.
 - **Memory**: the 8 MB PSRAM becomes the MicroPython heap; AMY mallocs from a 352 KB
@@ -87,6 +107,7 @@ Test scripts (run with `mpremote run <script>`):
 | `test_levels.py` | output peak for `amy.send()` vs injected MIDI notes (should match) |
 | `test_midi_inject.py` | injects MIDI through the parser UART MIDI uses; PASS/FAIL from DOUT activity |
 | `test_midi_keyboard.py` | play a keyboard into GP5 while it runs: bytes, messages and output peak every 2 s |
+| `test_usb_midi.sh` | run on the host: starts USB MIDI on the board, plays notes and a sysex + 16-note burst from the host (`send_usb_midi.py`, needs `pip install mido python-rtmidi`), reports what the board parsed |
 | `test_gp5.py` | raw activity on the MIDI-in pin, independent of the UART; if it shows no edges while you play, the problem is upstream of the chip |
 
 ## Status
@@ -95,7 +116,7 @@ Measured at the default 150 MHz: idle render load 6.5%, three Juno voices 34%, n
 underruns. Writing to the filesystem costs about one dropout (core 1 is paused while
 flash is written).
 
-Serial MIDI in works: a keyboard on UART1 plays the default synths (Juno on
+MIDI in works over both UART1 and USB: notes play the default synths (Juno on
 channel 1, DX7 on 2, drums on 10).
 
-Not done yet: USB MIDI, audio input, MCLK output, splitting rendering across both cores.
+Not done yet: USB MIDI output, audio input, MCLK output, splitting rendering across both cores.
