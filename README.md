@@ -13,22 +13,33 @@ amy.send(synth=1, note=60, vel=1)
 AMY's own Python package is frozen into the firmware unchanged; it finds the
 `c_amy` C module here the same way it finds the CPython one.
 
-## USB MIDI
+## Starting AMY at boot
 
-```python
-import amy, amy_usb_midi
-amy.live()
-amy_usb_midi.start()     # board reappears as "AMY RP2350" MIDI port + REPL serial port
+Nothing starts AMY by itself yet. To have it running from power-on (needed for
+amyboard.com/editor to find the board), install the provided `boot.py`:
+
+```bash
+mpremote cp board/boot.py :boot.py
 ```
 
-`start()` re-enumerates USB as a composite device: the usual REPL serial port plus
-a class-compliant MIDI port (no driver needed on macOS, Linux or Windows). Incoming
-USB MIDI goes to the same AMY parser as UART MIDI. Runtime USB configuration is
-dropped on soft reset, so put those lines in `boot.py` or `main.py` to have USB MIDI
-every boot. When connecting with `mpremote` after `start()`, use
-`mpremote resume ...`, since a soft reset would remove the MIDI port again.
+It runs `amy.live()` on every boot and soft reset (so `mpremote` sessions keep AMY
+running too), and catches errors so the REPL stays reachable. Remove it with
+`mpremote rm :boot.py`.
 
-USB MIDI is input only for now; AMY's MIDI output goes to the UART.
+## USB MIDI
+
+The board is always a composite USB device: the MicroPython REPL serial port plus
+a class-compliant MIDI port named **AMYboard RP2350** (no driver needed on macOS,
+Linux or Windows). It's there from power-on and survives soft resets.
+
+- **In:** incoming USB MIDI goes to the same AMY parser as UART MIDI.
+- **Out:** AMY's MIDI output goes to USB as well as the UART, including its replies
+  to the AMYboard editor's sysex (e.g. the `zI` ping is answered `OK`).
+- `amy.live(usb_midi=False)` / `midi=False` turn off USB / UART MIDI.
+
+macOS remembers MIDI device names by USB identity. If this board previously showed
+up under another name, delete that entry in Audio MIDI Setup (Window > Show MIDI
+Studio, with the board unplugged) and plug it back in.
 
 ## Pins (defaults)
 
@@ -69,9 +80,13 @@ picotool load -x build-PIMORONI_PICO_PLUS2/firmware.uf2
   I2S DMA. Core 0 (the MicroPython VM) only pushes wire messages into a lock-free
   single-producer/single-consumer ring (`modules/c_amy/amy_rp2.c`), so AMY's locks,
   which are no-ops on bare pico-sdk, are never needed.
-- **USB MIDI** (`py/amy_usb_midi.py`) uses micropython-lib's `usb-device-midi` class
-  (frozen in), with a 256-byte receive buffer, its OUT transfer restarted after each
-  drain, and each batch unpacked into one MIDI byte stream for AMY.
+- **USB MIDI** (`modules/c_amy/amy_rp2_usb.c`): TinyUSB's MIDI class is compiled in
+  (`CFG_TUD_MIDI=1`) and MicroPython's configuration descriptor is swapped for one
+  with its CDC interfaces plus MIDI (`-Wl,--wrap=tud_descriptor_configuration_cb`),
+  so the MicroPython tree is unmodified; `machine.USBDevice` is disabled. TinyUSB
+  runs on core 0 from MicroPython's scheduler: received MIDI goes into the ring to
+  core 1, and AMY's output is queued and written to TinyUSB by a callback a 1 ms
+  timer schedules on core 0.
 - **I2S** uses the PIO program bundled with AMY (`src/pico-audio/audio_i2s.pio.h`)
   with double-buffered DMA. No MCLK is generated, which the PCM5102 doesn't need.
 - **Memory**: the 8 MB PSRAM becomes the MicroPython heap; AMY mallocs from a 352 KB
@@ -107,7 +122,9 @@ Test scripts (run with `mpremote run <script>`):
 | `test_levels.py` | output peak for `amy.send()` vs injected MIDI notes (should match) |
 | `test_midi_inject.py` | injects MIDI through the parser UART MIDI uses; PASS/FAIL from DOUT activity |
 | `test_midi_keyboard.py` | play a keyboard into GP5 while it runs: bytes, messages and output peak every 2 s |
-| `test_usb_midi.sh` | run on the host: starts USB MIDI on the board, plays notes and a sysex + 16-note burst from the host (`send_usb_midi.py`, needs `pip install mido python-rtmidi`), reports what the board parsed |
+| `test_usb_midi.sh` | run on the host: starts AMY, plays notes and a sysex + 16-note burst into the board's USB MIDI port (`send_usb_midi.py`), checks the `zI` → `OK` reply (`ping_usb_midi.py`); needs `pip install mido python-rtmidi` |
+| `test_echo.py` | turns on echo while a note plays; delay lines that don't fit in SRAM go to the PSRAM pool |
+| `test_echo_psram.py` | asks for a 3 s echo (more than the PSRAM pool holds); AMY should log the failure and keep running |
 | `test_gp5.py` | raw activity on the MIDI-in pin, independent of the UART; if it shows no edges while you play, the problem is upstream of the chip |
 
 ## Status
@@ -119,4 +136,4 @@ flash is written).
 MIDI in works over both UART1 and USB: notes play the default synths (Juno on
 channel 1, DX7 on 2, drums on 10).
 
-Not done yet: USB MIDI output, audio input, MCLK output, splitting rendering across both cores.
+Not done yet: audio input, MCLK output, splitting rendering across both cores.

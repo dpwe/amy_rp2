@@ -10,7 +10,8 @@
 // live() kwargs (all optional): the feature flags chorus, reverb, echo, audio_in,
 // default_synths, partials, custom, startup_bleep; max_oscs, max_voices,
 // max_synths; pins bclk (lrc is always bclk + 1), dout, din, mclk, midi_in,
-// midi_out, midi_uart; and midi (False disables UART MIDI).
+// midi_out, midi_uart; midi (False disables UART MIDI) and usb_midi (False
+// disables USB MIDI).
 
 #include <string.h>
 
@@ -43,7 +44,7 @@ static mp_obj_t c_amy_live(size_t n_args, const mp_obj_t *args, mp_map_t *kw) {
     }
     amy_config_t c = amy_default_config();
     c.audio = AMY_AUDIO_IS_I2S;
-    c.midi = AMY_MIDI_IS_UART;
+    c.midi = AMY_MIDI_IS_UART | AMY_MIDI_IS_USB_GADGET;
     c.features.default_synths = 1;
     c.features.startup_bleep = 1;
     c.i2s_bclk = DEFAULT_I2S_BCLK;
@@ -82,7 +83,12 @@ static mp_obj_t c_amy_live(size_t n_args, const mp_obj_t *args, mp_map_t *kw) {
             case MP_QSTR_midi_in: c.midi_in = kw_int(v, -1, 47, k); break;
             case MP_QSTR_midi_out: c.midi_out = kw_int(v, -1, 47, k); break;
             case MP_QSTR_midi_uart: c.midi_uart = kw_int(v, 0, 1, k); break;
-            case MP_QSTR_midi: c.midi = mp_obj_is_true(v) ? AMY_MIDI_IS_UART : AMY_MIDI_IS_NONE; break;
+            case MP_QSTR_midi:
+                if (mp_obj_is_true(v)) c.midi |= AMY_MIDI_IS_UART; else c.midi &= ~AMY_MIDI_IS_UART;
+                break;
+            case MP_QSTR_usb_midi:
+                if (mp_obj_is_true(v)) c.midi |= AMY_MIDI_IS_USB_GADGET; else c.midi &= ~AMY_MIDI_IS_USB_GADGET;
+                break;
             default:
                 mp_raise_msg_varg(&mp_type_TypeError, MP_ERROR_TEXT("unexpected keyword argument '%q'"), k);
         }

@@ -45,6 +45,12 @@ void amy_rp2_midi_debug(uint32_t *uart_bytes, uint32_t *msgs, uint32_t *last_msg
 // Take (and clear) what AMY has written to stderr.
 size_t amy_rp2_log_take(char *out, size_t max);
 
+// USB MIDI (amy_rp2_usb.c): start the output pump (core 0), queue bytes to the
+// host from either core, and count output dropped because the host wasn't reading.
+void amy_rp2_usb_init(void);
+void amy_rp2_usb_midi_write(const uint8_t *bytes, size_t len);
+uint32_t amy_rp2_usb_midi_dropped(void);
+
 // Allocation stats (amy_rp2_mem.c).
 void amy_rp2_mem_stats(uint32_t *sram_used, uint32_t *sram_free, uint32_t *psram_used,
                        uint32_t *psram_size, uint32_t *failures);

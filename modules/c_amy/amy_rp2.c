@@ -258,6 +258,9 @@ void stop_midi(void) {
 
 void midi_out(uint8_t *bytes, uint16_t len) {
     midi_out_external_hook(bytes, len);
+    if (amy_global.config.midi & AMY_MIDI_IS_USB_GADGET) {
+        amy_rp2_usb_midi_write(bytes, len);
+    }
     if (amy_global.config.midi & AMY_MIDI_IS_UART) {
         uart_write_blocking(rp_get_uart(amy_global.config.midi_uart), bytes, len);
     }
@@ -361,6 +364,7 @@ bool amy_rp2_start(amy_config_t c) {
     ring_head = ring_tail = 0;
     underruns = 0;
     midi_uart_bytes = midi_msgs = midi_last_msg = 0;
+    amy_rp2_usb_init();
     // If startup wedges (e.g. AMY touching a failed allocation), reboot rather
     // than hang USB; the crumbs say how far it got.
     watchdog_enable(5000, true);

@@ -33,6 +33,7 @@ target_sources(usermod_c_amy INTERFACE
     ${CMAKE_CURRENT_LIST_DIR}/modc_amy.c
     ${CMAKE_CURRENT_LIST_DIR}/amy_rp2.c
     ${CMAKE_CURRENT_LIST_DIR}/amy_rp2_mem.c
+    ${CMAKE_CURRENT_LIST_DIR}/amy_rp2_usb.c
     ${CMAKE_CURRENT_LIST_DIR}/newlib_locks.c
     ${AMY_RP2_AMY_SOURCES}
 )
@@ -43,12 +44,24 @@ target_include_directories(usermod_c_amy INTERFACE
 )
 
 # We supply run_midi/stop_midi/midi_out (amy_rp2.c) and malloc_caps (amy_rp2_mem.c).
-target_compile_definitions(usermod_c_amy INTERFACE AMY_HOST_MIDI=1 MALLOC_CAPS_DEFINED=1)
+# PICO_MALLOC_PANIC=0: pico_malloc otherwise halts the chip when malloc fails,
+# so malloc_caps' fallback to the PSRAM pool (e.g. for echo delay lines) never runs.
+target_compile_definitions(usermod_c_amy INTERFACE AMY_HOST_MIDI=1 MALLOC_CAPS_DEFINED=1 PICO_MALLOC_PANIC=0)
 
 # AMY is third-party to MicroPython's warning policy; build it optimised.
 # Its free() calls go to amy_rp2_free(), which knows about the PSRAM pool
 # (amy_rp2_mem.c).  pico_malloc already owns --wrap=free.  Its fprintf()s go to
 # amy_rp2_fprintf(), readable as c_amy.log().
 set_source_files_properties(${AMY_RP2_AMY_SOURCES} PROPERTIES COMPILE_OPTIONS "-w;-O2;-Dfree=amy_rp2_free;-Dfprintf=amy_rp2_fprintf")
+
+# USB MIDI (amy_rp2_usb.c): turn on TinyUSB's MIDI class, and swap in a
+# configuration descriptor with MicroPython's CDC REPL plus a MIDI interface.
+target_compile_definitions(usermod_c_amy INTERFACE
+    CFG_TUD_MIDI=1
+    CFG_TUD_MIDI_RX_BUFSIZE=256
+    CFG_TUD_MIDI_TX_BUFSIZE=256
+    CFG_TUD_MIDI_EP_BUFSIZE=64
+)
+target_link_options(usermod_c_amy INTERFACE -Wl,--wrap=tud_descriptor_configuration_cb)
 
 target_link_libraries(usermod INTERFACE usermod_c_amy)
