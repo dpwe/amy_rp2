@@ -83,6 +83,11 @@ def _panel_on_bus(amyboard):
 
 _log = []  # (ms since power-on, event) for the panel bring-up; see below
 _watch_timer = None
+# False while a cold-boot panel watch is waiting for the SH1107 to get through
+# its self-reset; the sketch waits for this (see _run_sketch).
+_panel_settled = True
+_SETTLE_MIN_MS = 3000    # not before this long after power-on...
+_SETTLE_ON_MS = 500      # ...and not until the panel has read "on" this long
 
 
 def _log_event(msg):
@@ -126,13 +131,20 @@ def _resend_sh1107_addressing(amyboard):
     if hw is None or type(hw).__name__ != "SH1107_I2C":
         return
     hw.write_command(bytes([0x20 | (0x00 if hw.rotate90 else 0x01)]))
+    hw.write_command(b"\xb0")  # page address 0: show() never sets it, so any drift would stick
     amyboard.display.show(True)
     _log_event("addressing mode resent")
 
 
 def _sh1107_status(amyboard):
+    # A read returns the status byte only in command mode.  After a data write
+    # (the driver's show()) it would read display RAM instead -- and advance the
+    # panel's RAM address, shifting everything drawn afterwards.  So select
+    # command mode first with a bare control byte.
     try:
-        return amyboard.get_i2c().readfrom(0x3C, 1)[0]
+        i2c = amyboard.get_i2c()
+        i2c.writeto(0x3C, b"\x00")
+        return i2c.readfrom(0x3C, 1)[0]
     except OSError:
         return None
 
@@ -158,15 +170,26 @@ def _watch_sh1107(amyboard, ms=10000, period=50, retry_ms=300):
         return
     import time
     from machine import Timer
+    global _panel_settled
+    _panel_settled = False
     end = time.ticks_add(time.ticks_ms(), ms)
-    state = {"last": -1, "next_try": 0}
+    state = {"last": -1, "next_try": 0, "on_since": None}
 
     def tick(t):
+        global _panel_settled
         now = time.ticks_ms()
         st = _sh1107_status(amyboard)
         if st != state["last"]:
             _log_event("status %s" % ("no answer" if st is None else "0x%02x" % st))
             state["last"] = st
+        if st is None or st & 0x40:
+            state["on_since"] = None
+        elif state["on_since"] is None:
+            state["on_since"] = now
+        if (not _panel_settled and now >= _SETTLE_MIN_MS and state["on_since"] is not None
+                and time.ticks_diff(now, state["on_since"]) >= _SETTLE_ON_MS):
+            _panel_settled = True
+            _log_event("panel settled")
         if st is not None and st & 0x40 and time.ticks_diff(now, state["next_try"]) >= 0:
             state["next_try"] = time.ticks_add(now, retry_ms)
             try:
@@ -177,6 +200,11 @@ def _watch_sh1107(amyboard, ms=10000, period=50, retry_ms=300):
             state["last"] = -1
         if time.ticks_diff(now, end) > 0:
             t.deinit()
+            _panel_settled = True
+            try:
+                _resend_sh1107_addressing(amyboard)  # leave the addressing known-good
+            except OSError:
+                pass
             _log_event("watch done")
 
     global _watch_timer
@@ -185,7 +213,18 @@ def _watch_sh1107(amyboard, ms=10000, period=50, retry_ms=300):
 
 
 def _run_sketch():
-    import amyboard
+    # On a cold boot, wait for the panel to get through its self-reset: a sketch
+    # that draws at top level while the panel isn't answering raises an I2C
+    # error, and amyboard.run_sketch() then takes the sketch for corrupt and
+    # replaces it with the default sketch.  (We're unlocked here: USB and the
+    # watch keep running while we wait.)
+    import amyboard, time
+    deadline = time.ticks_add(time.ticks_ms(), 10000)
+    if not _panel_settled:
+        _log_event("sketch waiting for panel")
+    while not _panel_settled and time.ticks_diff(deadline, time.ticks_ms()) > 0:
+        time.sleep_ms(20)
+    _log_event("sketch start")
     _step("run_sketch", amyboard.run_sketch)
 
 

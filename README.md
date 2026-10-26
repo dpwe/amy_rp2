@@ -101,8 +101,15 @@ alone doesn't show it, since the panel is already powered. So on a cold boot
 `amyboard_boot` waits ~1 s before setting the panel up, sets it up twice, resends
 its vertical-addressing mode, then for 10 s polls the panel's status byte
 (bit 6 = display off) and sets it up again -- keeping what was drawn -- if it goes
-off. Before any I2C use it also clocks the bus free in case a reset interrupted a
-transfer. `amyboard_boot._log` has the timeline of the last cold boot.
+off. Status reads first select command mode (after a display-data write a read
+returns display RAM instead, and advances the panel's RAM address, which shifts
+everything drawn afterwards). On a cold boot the sketch waits until the panel
+has settled (>= 3 s after power-on and reading "on" for 0.5 s): a sketch that
+draws while the panel isn't answering raises an I2C error, which
+`amyboard.run_sketch()` takes for a corrupt sketch and replaces with the
+default. Before any I2C use the bus is also clocked free in case a reset
+interrupted a transfer. `amyboard_boot._log` has the timeline of the last cold
+boot.
 
 ## USB MIDI
 
