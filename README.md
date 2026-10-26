@@ -92,6 +92,18 @@ and the background I2C task AMYboard uses for display writes (display updates
 are plain I2C writes from Python; the drivers send only what changed).
 `amyboard.scan_i2c()` lists what's on the bus.
 
+**SH1107 cold start.** After power is first applied, the SH1107 panel tested here
+resets itself about 2.2 s after power-on, after it has been set up: it stops
+answering I2C for ~0.2 s and comes back in its power-on state (display off,
+mirrored, page addressing -- which looks like a mirror-image flash, a blank
+screen, or everything squeezed into an 8-pixel strip). A RESET of the RP2350
+alone doesn't show it, since the panel is already powered. So on a cold boot
+`amyboard_boot` waits ~1 s before setting the panel up, sets it up twice, resends
+its vertical-addressing mode, then for 10 s polls the panel's status byte
+(bit 6 = display off) and sets it up again -- keeping what was drawn -- if it goes
+off. Before any I2C use it also clocks the bus free in case a reset interrupted a
+transfer. `amyboard_boot._log` has the timeline of the last cold boot.
+
 ## USB MIDI
 
 The board is always a composite USB device: the MicroPython REPL serial port plus

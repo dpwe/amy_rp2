@@ -63,19 +63,125 @@ def _open_i2c(amyboard):
     amyboard.i2c = I2C(I2C_ID, sda=Pin(I2C_SDA), scl=Pin(I2C_SCL), freq=I2C_FREQ)
 
 
+# The SH1107 / SSD1327 panels need time after power-up before they take
+# commands (modules often hold the controller in reset with an RC on RST), and
+# the RP2350 reaches boot.py within a fraction of a second.  Without a wait the
+# first setup is lost (panel dark), and the next reset finds it half configured
+# (only a strip of the screen shows).  An AMYboard's ESP32 boots too slowly to
+# notice.
+_PANEL_READY_MS = 1000   # don't set the panel up sooner than this after power-on
+_PANEL_WAIT_MS = 500     # then wait up to this long for it to answer on I2C
+_PANELS = {0x3C, 0x3D}   # SH1107, SSD1327
+
+
+def _panel_on_bus(amyboard):
+    try:
+        return bool(set(amyboard.get_i2c().scan()) & _PANELS)
+    except OSError:
+        return False
+
+
+_log = []  # (ms since power-on, event) for the panel bring-up; see below
+_watch_timer = None
+
+
+def _log_event(msg):
+    import time
+    _log.append((time.ticks_ms(), msg))
+
+
 def _init_display(amyboard):
-    # Display() falls back to "no display" on any error, so if a panel is on the
-    # bus but didn't come up (a glitch after reset), give it one more go.
+    import time
+    cold = time.ticks_ms() < _PANEL_READY_MS + 2000  # just powered up (not a soft reset)
+    if cold:
+        while time.ticks_ms() < _PANEL_READY_MS:
+            time.sleep_ms(10)
+        deadline = time.ticks_add(time.ticks_ms(), _PANEL_WAIT_MS)
+        while not _panel_on_bus(amyboard) and time.ticks_diff(deadline, time.ticks_ms()) > 0:
+            time.sleep_ms(20)
+        _log_event("panel on bus: %s" % _panel_on_bus(amyboard))
     amyboard.init_display()
-    if not amyboard.display.available:
-        try:
-            on_bus = set(amyboard.get_i2c().scan()) & {0x3C, 0x3D}
-        except OSError:
-            on_bus = ()
-        if on_bus:
-            import time
-            time.sleep_ms(50)
-            amyboard.init_display()
+    _log_event("init 1: %s" % amyboard.display.available)
+    # Display() falls back to "no display" on any error; after a cold start a
+    # first setup can also be only partly taken.  Either way, one more go.
+    if cold or (not amyboard.display.available and _panel_on_bus(amyboard)):
+        time.sleep_ms(50)
+        amyboard.init_display()
+        _log_event("init 2: %s" % amyboard.display.available)
+    try:
+        _resend_sh1107_addressing(amyboard)
+    except OSError as e:
+        _log_event("addressing resend failed: %s" % e)  # the watch below recovers
+    if cold:
+        _watch_sh1107(amyboard)
+
+
+def _resend_sh1107_addressing(amyboard):
+    # After a cold power-up the SH1107 has been seen in its power-on page
+    # addressing mode despite the driver's setup having sent vertical
+    # addressing (0x21) -- and the driver's show() writes the screen assuming
+    # vertical addressing, so everything lands in one 8-pixel page.  Sending
+    # the mode again once setup is over (and redrawing) fixed it on the board.
+    hw = amyboard.display._hw
+    if hw is None or type(hw).__name__ != "SH1107_I2C":
+        return
+    hw.write_command(bytes([0x20 | (0x00 if hw.rotate90 else 0x01)]))
+    amyboard.display.show(True)
+    _log_event("addressing mode resent")
+
+
+def _sh1107_status(amyboard):
+    try:
+        return amyboard.get_i2c().readfrom(0x3C, 1)[0]
+    except OSError:
+        return None
+
+
+def _reinit_sh1107(amyboard):
+    # Set the panel up again, keeping what was drawn on it.
+    hw = amyboard.display._hw
+    keep = bytes(hw.displaybuf)
+    hw.init_display()  # clears the buffer
+    hw.displaybuf[:] = keep
+    _resend_sh1107_addressing(amyboard)
+
+
+def _watch_sh1107(amyboard, ms=10000, period=50, retry_ms=300):
+    # On a cold power-up the SH1107 has been seen to reset itself ~2 s after
+    # power-on, after we've set it up: it stops answering I2C for a moment and
+    # comes back in its power-on state (display off, mirrored, page
+    # addressing).  Its status byte (bit 6 = display off) shows that: for a
+    # while after a cold boot, poll it and set the panel up again whenever it
+    # reads "off".  Every change goes in _log.
+    hw = amyboard.display._hw
+    if hw is None or type(hw).__name__ != "SH1107_I2C":
+        return
+    import time
+    from machine import Timer
+    end = time.ticks_add(time.ticks_ms(), ms)
+    state = {"last": -1, "next_try": 0}
+
+    def tick(t):
+        now = time.ticks_ms()
+        st = _sh1107_status(amyboard)
+        if st != state["last"]:
+            _log_event("status %s" % ("no answer" if st is None else "0x%02x" % st))
+            state["last"] = st
+        if st is not None and st & 0x40 and time.ticks_diff(now, state["next_try"]) >= 0:
+            state["next_try"] = time.ticks_add(now, retry_ms)
+            try:
+                _reinit_sh1107(amyboard)
+                _log_event("panel was off: set up again")
+            except OSError as e:
+                _log_event("set up again failed: %s" % e)
+            state["last"] = -1
+        if time.ticks_diff(now, end) > 0:
+            t.deinit()
+            _log_event("watch done")
+
+    global _watch_timer
+    _watch_timer = Timer(-1, period=period, callback=tick)  # keep it alive (GC)
+    _log_event("watch started")
 
 
 def _run_sketch():
