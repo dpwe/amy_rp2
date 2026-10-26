@@ -56,12 +56,14 @@ size_t amy_rp2_log_take(char *out, size_t max);
 void amy_rp2_usb_init(void);
 void amy_rp2_usb_midi_write(const uint8_t *bytes, size_t len);
 uint32_t amy_rp2_usb_midi_dropped(void);
+bool amy_rp2_usb_up(void);  // MicroPython has initialised TinyUSB (after boot.py)
 
 // SPSS sysex (amy_rp2_sysex.c): core 1 queues complete F0 00 03 45 ... F7
 // payloads; a core 0 timer tick schedules their handling; AMY's file / exec /
 // reboot hooks.  zB0 (reboot, skip sketch) leaves this in watchdog scratch[3].
 #define AMY_RP2_SKIP_SKETCH_MAGIC 0x5B0057C0u
 bool amy_rp2_sysex_push(const uint8_t *payload, size_t len);
+void amy_rp2_reboot(uint8_t mode);  // zB modes: 0 skip sketch, 1 normal, 2 BOOTSEL
 void amy_rp2_sysex_tick(void);
 uint32_t amy_rp2_sysex_dropped(void);
 void amy_rp2_sysex_install_hooks(amy_config_t *c);
@@ -71,6 +73,9 @@ void amy_rp2_sysex_install_hooks(amy_config_t *c);
 void amy_rp2_tulip_install_hooks(amy_config_t *c);
 void amy_rp2_tulip_midi_in(uint8_t *bytes, uint16_t len, uint8_t is_sysex);
 void amy_rp2_tulip_tick(void);
+// MICROPY_BOARD_START_SOFT_RESET: drop references into the heap being wiped.
+void amy_rp2_tulip_soft_reset(void);
+void amy_rp2_sysex_soft_reset(void);
 
 // Allocation stats (amy_rp2_mem.c).
 void amy_rp2_mem_stats(uint32_t *sram_used, uint32_t *sram_free, uint32_t *psram_used,
@@ -80,6 +85,10 @@ void amy_rp2_mem_stats(uint32_t *sram_used, uint32_t *sram_free, uint32_t *psram
 // watchdog reboot that amy_rp2_start() arms around amy_start().
 //   scratch[0] = AMY_RP2_CRUMB | stage, [1] = PSRAM pool bytes, [2] = failed allocs
 #define AMY_RP2_CRUMB 0xA3700000u
+#define AMY_RP2_CRUMB_STOP_TIMEOUT 0xE0  // amy_rp2_stop() gave up on core 1; scratch[1] = where it was
+// Scratch 0..2 as the previous boot left them, and core 1's current activity.
+void amy_rp2_boot_crumbs(uint32_t out[3]);
+uint32_t amy_rp2_core1_where(void);
 
 // Hook for MICROPY_BOARD_START_SOFT_RESET.
 void amy_rp2_soft_reset(void);

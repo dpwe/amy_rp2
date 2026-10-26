@@ -146,6 +146,10 @@ void amy_rp2_usb_init(void) {
     }
 }
 
+bool amy_rp2_usb_up(void) {
+    return tud_inited();
+}
+
 uint32_t amy_rp2_usb_midi_dropped(void) {
     return tx_dropped;
 }

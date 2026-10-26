@@ -58,6 +58,16 @@ static volatile bool run_requested = false;
 static volatile int core1_state = CORE1_PARKED;
 static volatile bool amy_rp2_started = false;
 
+// What core 1 is doing, for diagnosing a stop that times out (see amy_rp2_stop).
+enum { C1_PARKED = 0, C1_UPDATE = 1, C1_CMD = 2, C1_RENDER = 3, C1_I2S_WAIT = 4, C1_MIDI_OUT = 5 };
+static volatile uint32_t core1_where = C1_PARKED;
+#define WHERE(w) (core1_where = (w))
+
+// Watchdog scratch 0..2 as found at the first amy_rp2_start() of this boot, i.e.
+// what the previous boot left there (c_amy.crumbs()).
+static uint32_t boot_crumbs[3];
+static bool boot_crumbs_taken = false;
+
 // The ABI wants SP 8-byte aligned (varargs doubles, e.g. printf("%f"), read
 // garbage otherwise); a bare uint32_t array only guarantees 4.
 static uint32_t core1_stack[16 * 1024 / sizeof(uint32_t)] __attribute__((aligned(16)));
@@ -85,6 +95,8 @@ uart_inst_t *rp_get_uart(int8_t index) {
     return NULL;
 }
 
+void midi_out(uint8_t *bytes, uint16_t len);
+
 // ------------- SPSS sysex scanner (core 1) -------------
 // Pulls complete F0 00 03 45 ... F7 frames out of a MIDI byte stream for
 // amy_rp2_sysex.c (handled on core 0, like AMYboard's MicroPython path);
@@ -103,6 +115,20 @@ typedef struct {
 // PSRAM: SRAM is fully budgeted; state is reset in amy_rp2_start().
 static spss_scan_t uart_scan __attribute__((section(".psram_uninitialised.amy_uart_scan")));
 static spss_scan_t ring_scan __attribute__((section(".psram_uninitialised.amy_ring_scan")));
+
+static void spss_frame(const uint8_t *p, size_t len) {
+    // zB (reboot) and zI (ping) are answered here on core 1, in plain C, so
+    // they work even when Python on core 0 is busy or stuck -- as AMYboard
+    // answers them in parse_sysex.  Everything else goes to core 0.
+    if (len >= 2 && p[0] == 'z' && p[1] == 'B') {
+        amy_rp2_reboot((len > 2 && p[2] >= '0' && p[2] <= '9') ? p[2] - '0' : 0);
+    } else if (len >= 2 && p[0] == 'z' && p[1] == 'I') {
+        uint8_t ok[] = { 0xF0, 0x00, 0x03, 0x45, 'O', 'K', 0xF7 };
+        midi_out(ok, sizeof(ok));
+    } else {
+        amy_rp2_sysex_push(p, len);
+    }
+}
 
 static void spss_feed(spss_scan_t *sc, const uint8_t *data, size_t n) {
     static const uint8_t spss_id[3] = { 0x00, 0x03, 0x45 };
@@ -141,7 +167,7 @@ static void spss_feed(spss_scan_t *sc, const uint8_t *data, size_t n) {
                 break;
             case SCAN_CAPTURE:
                 if (b == 0xF7) {
-                    amy_rp2_sysex_push(sc->buf, sc->len);
+                    spss_frame(sc->buf, sc->len);
                     sc->state = SCAN_PASS;
                 } else if (b & 0x80) {
                     sc->state = SCAN_PASS;  // truncated frame: drop it
@@ -188,6 +214,7 @@ static void drain_ring(void) {
             cmd_buf[i] = ring[(t + RING_HDR + i) & RING_MASK];
         }
         cmd_buf[len] = '\0';
+        WHERE((C1_CMD) | (type << 8));
         switch (type) {
             case AMY_RP2_CMD_WIRE:
                 amy_add_message(cmd_buf);
@@ -205,6 +232,7 @@ static void drain_ring(void) {
                 amy_bleep(strtoul(cmd_buf, NULL, 10));
                 break;
         }
+        WHERE(C1_UPDATE);
         // Only now is the entry done with: an empty ring means "all processed"
         // (amy_rp2_wait_idle relies on that).
         __dmb();
@@ -279,10 +307,12 @@ void amy_update_tasks(void) {
 }
 
 int16_t *amy_render_audio(void) {
+    WHERE(C1_RENDER);
     int64_t t0 = amy_get_us();
     amy_render(0, AMY_OSCS, 0);
     int16_t *block = amy_fill_buffer();
     amy_overload_check((uint32_t)(amy_get_us() - t0));
+    WHERE(C1_UPDATE);
     return block;
 }
 
@@ -303,9 +333,11 @@ size_t amy_i2s_write(const uint8_t *buffer, size_t nbytes) {
     // Wait for the other buffer to finish playing; keep MIDI and Python
     // commands flowing meanwhile (we're between renders, so this is safe).
     while (dma_channel_is_busy(i2s_dma)) {
+        WHERE(C1_I2S_WAIT);
         poll_midi_uart();
         drain_ring();
     }
+    WHERE(C1_UPDATE);
     dma_channel_transfer_from_buffer_now(i2s_dma, d, AMY_BLOCK_SIZE);
     dma_primed = true;
     dma_next ^= 1;
@@ -340,6 +372,8 @@ void stop_midi(void) {
 }
 
 void midi_out(uint8_t *bytes, uint16_t len) {
+    uint32_t was = core1_where;
+    if (get_core_num() == 1) WHERE(C1_MIDI_OUT);
     midi_out_external_hook(bytes, len);
     if (amy_global.config.midi & AMY_MIDI_IS_USB_GADGET) {
         amy_rp2_usb_midi_write(bytes, len);
@@ -347,6 +381,7 @@ void midi_out(uint8_t *bytes, uint16_t len) {
     if (amy_global.config.midi & AMY_MIDI_IS_UART) {
         uart_write_blocking(rp_get_uart(amy_global.config.midi_uart), bytes, len);
     }
+    if (get_core_num() == 1) WHERE(was);
 }
 
 // amy_default_synths() installs its own input hook, so ours goes in after
@@ -422,11 +457,13 @@ static void core1_main(void) {
     multicore_lockout_victim_init();
     while (true) {
         while (!run_requested) {
+            WHERE(C1_PARKED);
             core1_state = CORE1_PARKED;
             __wfe();
         }
         core1_state = CORE1_RUNNING;
         while (run_requested) {
+            WHERE(C1_UPDATE);
             amy_update();
         }
         if (AMY_HAS_I2S && i2s_dma >= 0) {
@@ -452,6 +489,10 @@ bool amy_rp2_start(amy_config_t c) {
     amy_rp2_usb_init();
     // If startup wedges (e.g. AMY touching a failed allocation), reboot rather
     // than hang USB; the crumbs say how far it got.
+    if (!boot_crumbs_taken) {
+        for (int i = 0; i < 3; ++i) boot_crumbs[i] = watchdog_hw->scratch[i];
+        boot_crumbs_taken = true;
+    }
     amy_rp2_sysex_install_hooks(&c);
     amy_rp2_tulip_install_hooks(&c);
     watchdog_enable(5000, true);
@@ -478,7 +519,17 @@ void amy_rp2_stop(void) {
     if (!amy_rp2_started) return;
     run_requested = false;
     __sev();
+    absolute_time_t deadline = make_timeout_time_ms(500);
     while (core1_state != CORE1_PARKED) {
+        if (time_reached(deadline)) {
+            // Core 1 is stuck mid-block, so AMY's state can't be torn down
+            // under it.  Rather than hang (and take USB with us), note where it
+            // was and reboot; c_amy.crumbs() shows this after the restart.
+            watchdog_hw->scratch[0] = AMY_RP2_CRUMB | AMY_RP2_CRUMB_STOP_TIMEOUT;
+            watchdog_hw->scratch[1] = core1_where;
+            watchdog_reboot(0, 0, 10);
+            for (;;) tight_loop_contents();
+        }
         tight_loop_contents();
     }
     amy_rp2_started = false;
@@ -487,6 +538,8 @@ void amy_rp2_stop(void) {
 
 void amy_rp2_soft_reset(void) {
     amy_rp2_stop();
+    amy_rp2_tulip_soft_reset();
+    amy_rp2_sysex_soft_reset();
 }
 
 bool amy_rp2_push(uint8_t type, const uint8_t *data, size_t len, uint32_t timeout_ms) {
@@ -528,6 +581,14 @@ uint32_t amy_rp2_take_peak(void) {
     uint32_t p = out_peak;
     out_peak = 0;
     return p;
+}
+
+void amy_rp2_boot_crumbs(uint32_t out[3]) {
+    for (int i = 0; i < 3; ++i) out[i] = boot_crumbs_taken ? boot_crumbs[i] : watchdog_hw->scratch[i];
+}
+
+uint32_t amy_rp2_core1_where(void) {
+    return core1_where;
 }
 
 uint32_t amy_rp2_underruns(void) {

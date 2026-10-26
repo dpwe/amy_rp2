@@ -23,6 +23,7 @@ static volatile uint32_t seq_period[SEQ_SLOTS];  // 0 = slot free
 static volatile uint32_t seq_offset[SEQ_SLOTS];
 static volatile uint32_t seq_due_tick[SEQ_SLOTS];
 static volatile bool seq_due[SEQ_SLOTS];
+static uint32_t seq_run_tick[SEQ_SLOTS];  // the tick handed to the callback
 
 static void seq_hook(uint32_t tick) {
     // Core 1, once per AMY sequencer tick: fn(tick) is due when tick % period == offset.
@@ -34,6 +35,19 @@ static void seq_hook(uint32_t tick) {
         }
     }
 }
+
+extern mp_obj_t amy_rp2_call_unlocked(mp_obj_t fn, mp_obj_t arg);
+
+static mp_obj_t seq_trampoline(mp_obj_t slot) {
+    // Scheduled for a due slot: run its callback (a sketch's loop(tick), via
+    // amyboard's TulipSequence) with the scheduler unlocked, so a slow or stuck
+    // loop() doesn't freeze USB.
+    int i = MP_OBJ_SMALL_INT_VALUE(slot);
+    mp_obj_t fn = MP_STATE_PORT(amy_rp2_seq_callbacks)[i];
+    if (fn == MP_OBJ_NULL) return mp_const_none;
+    return amy_rp2_call_unlocked(fn, mp_obj_new_int_from_uint(seq_run_tick[i]));
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(seq_trampoline_obj, seq_trampoline);
 
 static mp_obj_t seq_add_callback(mp_obj_t fn, mp_obj_t tick, mp_obj_t period) {
     for (int i = 0; i < SEQ_SLOTS; ++i) {
@@ -116,19 +130,11 @@ MP_DEFINE_CONST_FUN_OBJ_0(amy_rp2_midi_in_obj, midi_in);
 static mp_obj_t midi_trampoline(mp_obj_t is_sysex) {
     // Scheduled instead of the Python callback itself: clear the pending flag
     // first, so a callback that raises (a sketch's midi.add_callback handler,
-    // say) can't leave MIDI to Python blocked for good.
+    // say) can't leave MIDI to Python blocked for good; run it unlocked.
     midi_cb_pending = false;
     mp_obj_t cb = MP_STATE_PORT(amy_rp2_midi_callback);
     if (cb == MP_OBJ_NULL) return mp_const_none;
-    nlr_buf_t nlr;
-    if (nlr_push(&nlr) == 0) {
-        mp_call_function_1(cb, is_sysex);
-        nlr_pop();
-    } else {
-        mp_printf(&mp_plat_print, "MIDI callback raised:\n");
-        mp_obj_print_exception(&mp_plat_print, MP_OBJ_FROM_PTR(nlr.ret_val));
-    }
-    return mp_const_none;
+    return amy_rp2_call_unlocked(cb, is_sysex);  // errors are reported, not raised
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(midi_trampoline_obj, midi_trampoline);
 
@@ -163,6 +169,17 @@ MP_DEFINE_CONST_FUN_OBJ_0(amy_rp2_bootloader_mode_obj, bootloader_mode);
 
 // ------------- glue -------------
 
+void amy_rp2_tulip_soft_reset(void) {
+    // MicroPython is wiping its heap and scheduler queue: drop every reference
+    // into it, or the next sequencer tick calls a freed loop().
+    for (int i = 0; i < SEQ_SLOTS; ++i) seq_free(i);
+    MP_STATE_PORT(amy_rp2_midi_callback) = MP_OBJ_NULL;
+    MP_STATE_PORT(amy_rp2_overload_callback) = MP_OBJ_NULL;
+    midi_cb_pending = false;
+    midiq_tail = midiq_head;
+    overload_pct = -1;
+}
+
 void amy_rp2_tulip_install_hooks(amy_config_t *c) {
     c->amy_external_sequencer_hook = seq_hook;
     c->amy_external_overload_hook = overload_hook;
@@ -172,8 +189,9 @@ void amy_rp2_tulip_tick(void) {
     // Core 0 timer IRQ: schedule whatever core 1 marked due.
     for (int i = 0; i < SEQ_SLOTS; ++i) {
         if (seq_due[i]) {
-            mp_obj_t fn = MP_STATE_PORT(amy_rp2_seq_callbacks)[i];
-            if (fn == MP_OBJ_NULL || mp_sched_schedule(fn, MP_OBJ_NEW_SMALL_INT(seq_due_tick[i]))) {
+            seq_run_tick[i] = seq_due_tick[i];
+            if (MP_STATE_PORT(amy_rp2_seq_callbacks)[i] == MP_OBJ_NULL
+                || mp_sched_schedule(MP_OBJ_FROM_PTR(&seq_trampoline_obj), MP_OBJ_NEW_SMALL_INT(i))) {
                 seq_due[i] = false;  // else the schedule queue is full: retry next tick
             }
         }

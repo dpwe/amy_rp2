@@ -201,10 +201,15 @@ static mp_obj_t c_amy_mem(void) {
 static MP_DEFINE_CONST_FUN_OBJ_0(c_amy_mem_obj, c_amy_mem);
 
 static mp_obj_t c_amy_crumbs(void) {
-    // Watchdog scratch 0..2 -- see AMY_RP2_CRUMB in amy_rp2.h.
-    mp_obj_t t[3];
-    for (int i = 0; i < 3; ++i) t[i] = mp_obj_new_int_from_uint(watchdog_hw->scratch[i]);
-    return mp_obj_new_tuple(3, t);
+    // Watchdog scratch 0..2 as the previous boot left them (before this boot's
+    // AMY start overwrote them), plus core 1's current activity -- see
+    // AMY_RP2_CRUMB in amy_rp2.h.
+    uint32_t v[3];
+    amy_rp2_boot_crumbs(v);
+    mp_obj_t t[4];
+    for (int i = 0; i < 3; ++i) t[i] = mp_obj_new_int_from_uint(v[i]);
+    t[3] = mp_obj_new_int_from_uint(amy_rp2_core1_where());
+    return mp_obj_new_tuple(4, t);
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(c_amy_crumbs_obj, c_amy_crumbs);
 
@@ -248,6 +253,14 @@ static mp_obj_t c_amy_midi_out(mp_obj_t data) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(c_amy_midi_out_obj, c_amy_midi_out);
 
+#include "shared/runtime/pyexec.h"
+
+static mp_obj_t c_amy_raw_repl(void) {
+    // True while a tool (mpremote, Thonny, ...) is driving the raw REPL.
+    return mp_obj_new_bool(pyexec_mode_kind == PYEXEC_MODE_RAW_REPL);
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(c_amy_raw_repl_obj, c_amy_raw_repl);
+
 static mp_obj_t c_amy_stack_unused(void) {
     return mp_obj_new_int_from_uint(amy_rp2_core1_stack_unused());
 }
@@ -256,7 +269,8 @@ static MP_DEFINE_CONST_FUN_OBJ_0(c_amy_stack_unused_obj, c_amy_stack_unused);
 // _tulip support, defined in amy_rp2_tulip.c.
 extern const mp_obj_fun_builtin_fixed_t amy_rp2_seq_add_callback_obj, amy_rp2_seq_remove_callback_obj,
     amy_rp2_seq_remove_callbacks_obj, amy_rp2_seq_ticks_obj, amy_rp2_midi_callback_obj, amy_rp2_midi_in_obj,
-    amy_rp2_sysex_in_obj, amy_rp2_overload_callback_obj, amy_rp2_bootloader_mode_obj;
+    amy_rp2_sysex_in_obj, amy_rp2_overload_callback_obj, amy_rp2_bootloader_mode_obj,
+    amy_rp2_call_soon_unlocked_obj;
 
 static const mp_rom_map_elem_t c_amy_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR___name__), MP_ROM_QSTR(MP_QSTR_c_amy) },
@@ -277,6 +291,7 @@ static const mp_rom_map_elem_t c_amy_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_midi_debug), MP_ROM_PTR(&c_amy_midi_debug_obj) },
     { MP_ROM_QSTR(MP_QSTR_log), MP_ROM_PTR(&c_amy_log_obj) },
     { MP_ROM_QSTR(MP_QSTR_stack_unused), MP_ROM_PTR(&c_amy_stack_unused_obj) },
+    { MP_ROM_QSTR(MP_QSTR_raw_repl), MP_ROM_PTR(&c_amy_raw_repl_obj) },
     { MP_ROM_QSTR(MP_QSTR_peak), MP_ROM_PTR(&c_amy_peak_obj) },
     { MP_ROM_QSTR(MP_QSTR_version), MP_ROM_PTR(&c_amy_version_obj) },
     { MP_ROM_QSTR(MP_QSTR_midi_out), MP_ROM_PTR(&c_amy_midi_out_obj) },
@@ -289,6 +304,7 @@ static const mp_rom_map_elem_t c_amy_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_sysex_in), MP_ROM_PTR(&amy_rp2_sysex_in_obj) },
     { MP_ROM_QSTR(MP_QSTR_amy_overload_callback), MP_ROM_PTR(&amy_rp2_overload_callback_obj) },
     { MP_ROM_QSTR(MP_QSTR_bootloader_mode), MP_ROM_PTR(&amy_rp2_bootloader_mode_obj) },
+    { MP_ROM_QSTR(MP_QSTR_call_soon_unlocked), MP_ROM_PTR(&amy_rp2_call_soon_unlocked_obj) },
 };
 static MP_DEFINE_CONST_DICT(c_amy_module_globals, c_amy_module_globals_table);
 

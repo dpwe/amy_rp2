@@ -23,11 +23,32 @@ mpremote cp board/boot.py :boot.py
 
 On every boot and soft reset it runs `amyboard_boot.boot()` (frozen in): it starts
 AMY on core 1, then does what an AMYboard does at startup (tulipcc's
-`_boot.py`): `amyboard.ensure_user_environment()`, `init_display()`,
-`start_amy()` (default patches, then `/user/current/sketch.py` with its
-`loop(tick)`), and hooks MIDI input up to `midi.add_callback()`. Each step reports
-failures and carries on, so the REPL always comes up. Remove it with
-`mpremote rm :boot.py`.
+`_boot.py`): `amyboard.ensure_user_environment()`, `init_display()`, the default
+patches, and hooks MIDI input up to `midi.add_callback()`. The sketch
+(`/user/current/sketch.py`, with its `loop(tick)`) is queued to start once
+MicroPython has brought USB up, which it does only after `boot.py` returns, so a
+sketch that hangs can't take USB down with it. Each step reports failures and
+carries on, so the REPL always comes up. Remove it with `mpremote rm :boot.py`.
+
+The sketch isn't auto-started when a tool such as `mpremote` soft-resets the board
+through the raw REPL (its output would land in the middle of the tool's
+protocol); AMY still runs, and the sketch starts on the next real boot, Ctrl-D,
+or editor write.
+
+## Recovering from a bad sketch
+
+A sketch that hangs or is very slow doesn't freeze the board:
+
+- Sketch code (top level, `loop(tick)`, MIDI callbacks, the editor's `zP`
+  commands) runs from MicroPython's scheduler with the scheduler unlocked, so USB,
+  MIDI and the editor protocol keep working, and **Ctrl-C** interrupts it (a sketch
+  restarted twice -- by the transfer-done hook and by the editor -- needs two).
+- The editor's ping (`zI`) and reboot (`zB`) are answered on core 1 in plain C, so
+  they work whatever Python is doing. **`zB0`** (what the editor sends for a wedged
+  board) reboots *without* the sketch; `zB1` is a normal reboot; **`zB2`** reboots
+  into BOOTSEL, so the board can be reflashed without touching it.
+- A soft reset can't deadlock on AMY: if core 1 doesn't stop within 500 ms the board
+  reboots instead, and `c_amy.crumbs()` afterwards shows where core 1 was.
 
 ## AMYboard firmware Python (amyboard.py)
 
@@ -164,7 +185,8 @@ picotool load -x build-PIMORONI_PICO_PLUS2/firmware.uf2
 | `c_amy.log()` | what AMY has printed to stderr since the last call (its `fprintf`s are redirected here) |
 | `c_amy.mem()` | `(sram_used, sram_free, psram_used, psram_pool, failed_allocs)` |
 | `c_amy.stack_unused()` | bytes of core 1's 16 KB stack never touched (high-water mark) |
-| `c_amy.crumbs()` | startup breadcrumbs; `amy.live()` arms a 5 s watchdog, so a startup hang reboots the board and this shows where it stopped |
+| `c_amy.crumbs()` | `(s0, s1, s2, core1)`: watchdog scratch 0..2 as the *previous* boot left them, and what core 1 is doing now. `amy.live()` arms a 5 s watchdog, so a startup hang reboots and s0 = `0xA37000nn` shows the stage; s0 = `0xA37000E0` means a soft reset gave up waiting for core 1, with its activity in s1 |
+| `c_amy.raw_repl()` | whether a tool is driving the raw REPL |
 
 Test scripts (run with `mpremote run <script>`):
 
@@ -182,6 +204,7 @@ Test scripts (run with `mpremote run <script>`):
 | `spss_host.py test` | the editor's sysex protocol: `zI` ping, `zP` exec, `zT` file write and `zD` read-back, a wire message |
 | `test_sketch_loop.py` | a sketch whose `loop(tick)` counts calls and plays notes; write it with `spss_host.py write test_sketch_loop.py /user/current/sketch.py` then `spss_host.py exec "import amyboard; amyboard.environment_transfer_done()"` and check `sketch.calls` (~14/s at 108 BPM) |
 | `spss_host.py editor` | the editor's "Write to your AMYboard" sequence: version probe, `sketch.py` transfer, restart; then a sketch with an error, which should be reported |
+| `hang_test.py hang` / `reboot` / `fix` | recovery from a sketch that hangs: write one via the editor protocol (ping should still answer), normal reboot with it in place (USB should come up), then write `test_sketch_loop.py` over it |
 | `test_gp5.py` | raw activity on the MIDI-in pin, independent of the UART; if it shows no edges while you play, the problem is upstream of the chip |
 
 ## Status
@@ -193,6 +216,8 @@ flash is written).
 MIDI in works over both UART1 and USB: notes play the default synths (Juno on
 channel 1, DX7 on 2, drums on 10).
 
-Sketches from amyboard.com/editor run with `loop(tick)`.
+Sketches from amyboard.com/editor run with `loop(tick)`; factory reset, the
+overload report (`L`), error reports (`X`), version (`V`) and the `zB` reboot
+modes work as on an AMYboard.
 
 Not done yet: audio input, MCLK output, splitting rendering across both cores.
