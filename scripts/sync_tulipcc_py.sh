@@ -16,6 +16,9 @@ tulip/shared/py/arpegg.py
 tulip/shared/py/patches.py
 tulip/shared/py/tulip_queue.py
 tulip/shared/py/upysh.py
+tulip/shared/py/sh1107.py
+tulip/shared/py/ssd1327.py
+tulip/shared/py/ads1115.py
 tulip/shared/amyboard-py/amyboard.py
 "
 mkdir -p "$DEST"
